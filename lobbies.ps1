@@ -35,6 +35,7 @@ if ($Watch) {
 using System;
 using System.Text;
 using System.Diagnostics;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 public static class L4dWatch {
     [DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr LoadLibraryW(string p);
@@ -50,6 +51,8 @@ public static class L4dWatch {
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int D_Pipe();
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void D_PipeVoid(int pipe);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] [return: MarshalAs(UnmanagedType.I1)] delegate bool D_NextCb(int pipe, IntPtr msg);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] [return: MarshalAs(UnmanagedType.I1)] delegate bool D_ReqLobby(IntPtr self, ulong lobby);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate IntPtr D_LobbyData(IntPtr self, ulong lobby, [MarshalAs(UnmanagedType.LPStr)] string key);
     static IntPtr h;
     static T F<T>(string n) where T : class {
         IntPtr p = GetProcAddress(h, n);
@@ -98,6 +101,13 @@ public static class L4dWatch {
             var game = F<D_Game>("SteamAPI_ISteamFriends_GetFriendGamePlayed");
             var name = F<D_Name>("SteamAPI_ISteamFriends_GetFriendPersonaName");
             ulong me = F<D_SteamId>("SteamAPI_ISteamUser_GetSteamID")(us);
+            // Datos de las salas donde están vos y tus amigos (campaña, capítulo, jugadores, pública/amigos):
+            // Steam avisa al instante cuando cambian (LobbyDataUpdate_t) si estás adentro; las otras se piden cada 30 s.
+            IntPtr mm = F<D_Iface>("SteamAPI_SteamMatchmaking_v009")();
+            var reqLobby = F<D_ReqLobby>("SteamAPI_ISteamMatchmaking_RequestLobbyData");
+            var lobbyData = F<D_LobbyData>("SteamAPI_ISteamMatchmaking_GetLobbyData");
+            var seenLobbies = new List<ulong>();
+            var askedAt = new Dictionary<ulong, DateTime>();
             IntPtr info = Marshal.AllocHGlobal(32);
             // FriendGameInfo_t: uint64 gameId, uint32 ip, uint16 port, uint16 queryPort, uint64 lobby
             Func<ulong, string> where = (id) => {
@@ -108,6 +118,7 @@ public static class L4dWatch {
                 uint ip = (uint)Marshal.ReadInt32(info, 8);
                 int port = (ushort)Marshal.ReadInt16(info, 12);
                 ulong lobby = (ulong)Marshal.ReadInt64(info, 16);
+                if (lobby != 0 && !seenLobbies.Contains(lobby)) seenLobbies.Add(lobby);
                 string srv = ip == 0 ? "" : ((ip >> 24) & 255) + "." + ((ip >> 16) & 255) + "." + ((ip >> 8) & 255) + "." + (ip & 255) + ":" + port;
                 return "\"server\":\"" + srv + "\",\"lobby\":\"" + (lobby == 0 ? "" : lobby.ToString()) + "\"";
             };
@@ -117,7 +128,8 @@ public static class L4dWatch {
                 bool changed = false;
                 runFrame(pipe);
                 while (nextCb(pipe, cbMsg)) {
-                    if (Marshal.ReadInt32(cbMsg, 4) == 304) changed = true;   // PersonaStateChange_t
+                    int cbId = Marshal.ReadInt32(cbMsg, 4);
+                    if (cbId == 304 || cbId == 505) changed = true;   // PersonaStateChange_t, LobbyDataUpdate_t
                     freeCb(pipe);
                 }
                 // Por las dudas (avisos que Steam no manda, p. ej. algunos cambios de sala) se revisa igual cada 2 s
@@ -131,6 +143,7 @@ public static class L4dWatch {
                     else if ((DateTime.Now - noGameSince).TotalSeconds > 5) break;
                 }
                 var sb = new StringBuilder();
+                seenLobbies.Clear();
                 string mine = where(me);
                 sb.Append("{\"me\":{").Append(mine ?? "\"server\":\"\",\"lobby\":\"\"").Append(",\"playing\":").Append(mine != null ? "true" : "false").Append("},\"friends\":[");
                 int n = count(fr, 4), added = 0;
@@ -141,7 +154,23 @@ public static class L4dWatch {
                     if (added++ > 0) sb.Append(',');
                     sb.Append("{\"id\":\"").Append(id).Append("\",\"name\":\"").Append(Esc(Utf8(name(fr, id)))).Append("\",").Append(w).Append('}');
                 }
-                sb.Append("]}");
+                sb.Append("],\"lobbies\":{");
+                int nl = 0;
+                foreach (ulong lid in seenLobbies) {
+                    DateTime at;
+                    if (!askedAt.TryGetValue(lid, out at) || (DateTime.Now - at).TotalSeconds > 30) { reqLobby(mm, lid); askedAt[lid] = DateTime.Now; }
+                    string camp = Utf8(lobbyData(mm, lid, "Game:campaign"));
+                    if (camp == "") continue;
+                    if (nl++ > 0) sb.Append(',');
+                    sb.Append('"').Append(lid).Append("\":{\"campaign\":\"").Append(Esc(camp)).Append('"');
+                    string[,] keys = { { "chapter", "Game:chapter" }, { "state", "Game:state" }, { "title", "Game:MissionInfo:DisplayTitle" },
+                        { "ws", "Game:MissionInfo:workshopid" }, { "players", "Members:numPlayers" }, { "slots", "Members:numSlots" },
+                        { "access", "System:access" }, { "server", "Options:server" }, { "mode", "Game:mode" } };
+                    for (int k = 0; k < keys.GetLength(0); k++)
+                        sb.Append(",\"").Append(keys[k, 0]).Append("\":\"").Append(Esc(Utf8(lobbyData(mm, lid, keys[k, 1])))).Append('"');
+                    sb.Append('}');
+                }
+                sb.Append("}}");
                 string line = sb.ToString();
                 if (line != last) {   // solo cuando algo cambia
                     Console.Out.WriteLine(line); Console.Out.Flush();

@@ -697,6 +697,10 @@ $groupBar.Controls.Add($groupRight)
 $groupBar.Controls.Add($groupLeft)
 $groupLeft.BringToFront()   # el Fill se acomoda despues del de la derecha
 
+# Dónde están los del grupo (se llena con el vigía de Steam; ver "dónde están" más abajo)
+$wherePanel = New-Object Windows.Forms.Panel
+$wherePanel.Dock = 'Top'; $wherePanel.Height = 0; $wherePanel.BackColor = $C.Panel; $wherePanel.Visible = $false
+
 # Lista de tarjetas
 $list = New-Object Windows.Forms.FlowLayoutPanel
 $list.Dock = 'Fill'; $list.AutoScroll = $true; $list.FlowDirection = 'TopDown'; $list.WrapContents = $false
@@ -717,6 +721,7 @@ $statusBar.Controls.Add($btnRestart)
 
 $form.Controls.Add($list)
 $form.Controls.Add($statusBar)
+$form.Controls.Add($wherePanel)
 $form.Controls.Add($groupBar)
 $form.Controls.Add($modeBar)
 $form.Controls.Add($filters)
@@ -733,8 +738,8 @@ function Get-PingColor([int]$ms) {
 
 # Imagen del mapa recortada al tamaño de la tarjeta, que se funde con el fondo a la derecha
 $script:thumbCache = @{}
-function Get-CardThumb($img, [int]$w, [int]$h) {
-    $key = "$([Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($img))_$($w)x$h"
+function Get-CardThumb($img, [int]$w, [int]$h, $bg = $C.Card) {
+    $key = "$([Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($img))_$($w)x$($h)_$($bg.ToArgb())"
     if ($script:thumbCache.ContainsKey($key)) { return $script:thumbCache[$key] }
     $bmp = New-Object Drawing.Bitmap($w, $h)
     $g = [Drawing.Graphics]::FromImage($bmp)
@@ -743,7 +748,7 @@ function Get-CardThumb($img, [int]$w, [int]$h) {
     $dw = $img.Width * $s; $dh = $img.Height * $s
     $g.DrawImage($img, [single](($w - $dw) / 2), [single](($h - $dh) / 2), [single]$dw, [single]$dh)
     $fadeW = 70
-    $fade = New-Object Drawing.Drawing2D.LinearGradientBrush((New-Object Drawing.Rectangle(($w - $fadeW), 0, $fadeW, $h)), ([Drawing.Color]::FromArgb(0, $C.Card)), $C.Card, 0.0)
+    $fade = New-Object Drawing.Drawing2D.LinearGradientBrush((New-Object Drawing.Rectangle(($w - $fadeW), 0, $fadeW, $h)), ([Drawing.Color]::FromArgb(0, $bg)), $bg, 0.0)
     $g.FillRectangle($fade, ($w - $fadeW), 0, $fadeW, $h)
     $g.Dispose()
     $script:thumbCache[$key] = $bmp
@@ -752,12 +757,12 @@ function Get-CardThumb($img, [int]$w, [int]$h) {
 
 # Una marca por lugar: llenas = jugadores, vacias = lugares libres (servers de mas de 8: solo el numero)
 $script:pipCache = @{}
-function Get-SlotPips([int]$humans, [int]$max, $color) {
-    $key = "$humans/$max/$($color.ToArgb())"
+function Get-SlotPips([int]$humans, [int]$max, $color, $bg = $C.Card) {
+    $key = "$humans/$max/$($color.ToArgb())/$($bg.ToArgb())"
     if ($script:pipCache.ContainsKey($key)) { return $script:pipCache[$key] }
     $bmp = New-Object Drawing.Bitmap(120, 12)
     $g = [Drawing.Graphics]::FromImage($bmp)
-    $g.Clear($C.Card)
+    $g.Clear($bg)
     if ($max -ge 1 -and $max -le 8) {
         $pw = 11; $gap = 3   # sin separar equipos: no sabemos como estan repartidos
         $total = $max * $pw + ($max - 1) * $gap
@@ -888,11 +893,12 @@ function New-Card($r) {
 # Una tarjeta armada con ~20 controles hace que al scrollear Windows no llegue a repintarlos y queden rayas
 # "corridas". Por eso, ya armada, se "fotografía" entera en una sola imagen de fondo y solo quedan vivos los
 # botones: al scrollear se mueven imágenes, que es instantáneo.
-function Convert-CardToImage($card, [object[]]$keep) {
+function Convert-CardToImage($card, [object[]]$keep, [scriptblock]$decorate) {
     try {
         $bmp = New-Object Drawing.Bitmap($card.Width, $card.Height)
         foreach ($k in $keep) { $k.Visible = $false }
         $card.DrawToBitmap($bmp, (New-Object Drawing.Rectangle(0, 0, $card.Width, $card.Height)))
+        if ($decorate) { $gd = [Drawing.Graphics]::FromImage($bmp); $gd.SmoothingMode = 'AntiAlias'; try { & $decorate $gd $card.Width $card.Height } finally { $gd.Dispose() } }
         foreach ($k in $keep) { $k.Visible = $true }
         foreach ($ctl in @($card.Controls | Where-Object { $keep -notcontains $_ })) { $card.Controls.Remove($ctl); $ctl.Dispose() }
         $card.SetFace($bmp)
@@ -1243,9 +1249,35 @@ $list.add_Scroll({ [void][L4dShell.Redraw]::RedrawWindow($list.Handle, [IntPtr]:
 $list.add_MouseWheel({ [void][L4dShell.Redraw]::RedrawWindow($list.Handle, [IntPtr]::Zero, [IntPtr]::Zero, 0x0180) })
 
 # ---------------- acciones ----------------
+# Traer el juego al frente (y sacarlo de minimizado) al tocar Unirme. Si el juego todavía no está abierto,
+# Steam lo abre y aparece adelante solo.
+if (-not ('L4dShell.Focus' -as [type])) {
+    Add-Type -Name Focus -Namespace L4dShell -MemberDefinition ('[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);' +
+        '[DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);' +
+        '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);' +
+        '[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();')
+}
+function Show-Game {
+    $g = Get-Process left4dead2 -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } | Select-Object -First 1
+    if (-not $g) { return $false }
+    $h = $g.MainWindowHandle
+    if ([L4dShell.Focus]::IsIconic($h)) { [void][L4dShell.Focus]::ShowWindow($h, 9) }   # 9 = restaurar
+    [void][L4dShell.Focus]::SetForegroundWindow($h)
+    return $true
+}
+$gameFront = New-Object Windows.Forms.Timer
+$gameFront.Interval = 1200
+$gameFront.add_Tick({
+        # Segundo intento, por si Steam se quedó con el foco al procesar el link
+        $this.Stop()
+        $g = Get-Process left4dead2 -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($g -and [L4dShell.Focus]::GetForegroundWindow() -ne $g.MainWindowHandle) { [void](Show-Game) }
+    })
+
 function Invoke-Join([string]$link) {
     Write-AppLog "Unirme (botón): $link"
     Start-Process $link
+    if (Show-Game) { $gameFront.Stop(); $gameFront.Start() }
     if ($link -like 'steam://joinlobby/*') {
         $status.Text = 'Entrando a la sala...  Si "Compartir mi partida" está tildado, tus amigos que te siguen entran solos.'
     } else {
@@ -1473,6 +1505,7 @@ function Show-Group {
         $groupMembers.Controls.Add($item)
     }
     Request-Avatars @($script:groupData | ForEach-Object { $_.Sid }) $null
+    if (Get-Command Update-Where -ErrorAction SilentlyContinue) { Update-Where }
 }
 
 # Arma el grupo con los avisos de todas las apps: el líder es el final de la cadena de "a quién sigo"
@@ -1719,6 +1752,7 @@ function Receive-WatchLine([string]$line) {
     # Saliste de una partida o sala (volviste al menú): buen momento para tener la lista al día
     if ($before -and "$($before.me.server)$($before.me.lobby)" -and -not "$($now.me.server)$($now.me.lobby)") { Invoke-AutoRefresh 'saliste de la partida' 0 }
     Invoke-FollowCheck
+    Update-Where
 }
 function Stop-Watcher {
     $w = $script:watch
@@ -1727,6 +1761,7 @@ function Stop-Watcher {
     $gameTimer.Interval = if ($script:watchFails) { [math]::Min(120000, 10000 * $script:watchFails) } else { 3000 }
     $gameTimer.Start()
     Write-AppLog 'Vigía de Steam terminado.'
+    Update-Where
 }
 # Lo único que se sigue mirando cada tanto: si abriste el juego (mirar la lista de procesos no cuesta nada;
 # el aviso de Windows para esto pide permisos de administrador). Con el juego abierto queda apagado.
@@ -1737,6 +1772,259 @@ $gameTimer.add_Tick({
         if (Get-Process left4dead2 -ErrorAction SilentlyContinue) { Start-Watcher }
     })
 $gameTimer.Start()
+
+# ---------------- dónde están ----------------
+# Debajo de "Tu grupo", una tarjeta por cada lugar donde hay alguien del grupo (vos incluido): imagen del
+# mapa, campaña y capítulo, server o sala, si es pública o de solo amigos, quiénes están ahí y cuántos
+# lugares quedan. Se arma con lo que avisa el vigía de Steam (al instante) y, para los servers, con una
+# consulta directa al server (mapa y jugadores) cada 15 s mientras haya alguien adentro.
+$script:whereInfo = @{}      # "ip:puerto" -> respuesta del server (Name, Map, Players, MaxPlayers, Ping)
+$script:whereKey = $null
+$script:whereAddrs = ''
+$whereApply = New-Object Windows.Forms.Timer
+$whereApply.Interval = 200
+$whereApply.add_Tick({ $this.Stop(); Show-Where })
+function Update-Where { $whereApply.Stop(); $whereApply.Start() }
+$whereTimer = New-Object Windows.Forms.Timer
+$whereTimer.Interval = 15000
+$whereTimer.add_Tick({ Request-WhereInfo })
+$wherePanel.add_Resize({ if ($wherePanel.Visible) { Update-Where } })
+
+function Get-WhereData {
+    $now = $script:steamNow
+    if (-not $now -or -not $script:me) { return $null }
+    $members = @($script:groupData | Where-Object { $_.Sid })
+    if (-not @($members | Where-Object { $_.Sid -eq $script:me }).Count) { $members = @([pscustomobject]@{ Sid = $script:me; Name = 'Vos'; Leader = $false }) + $members }
+    $locs = [ordered]@{}
+    $others = New-Object Collections.ArrayList
+    foreach ($m in $members) {
+        $st = if ($m.Sid -eq $script:me) { $now.me } else { @($now.friends | Where-Object { [string]$_.id -eq $m.Sid }) | Select-Object -First 1 }
+        if (-not $st) { [void]$others.Add("$($m.Name): no está jugando L4D2"); continue }
+        $srv = [string]$st.server; $lob = [string]$st.lobby
+        if (-not $srv -and -not $lob) { [void]$others.Add("$($m.Name): en el menú del juego"); continue }
+        $key = if ($srv) { "s:$srv" } else { "l:$lob" }
+        if (-not $locs.Contains($key)) { $locs[$key] = [pscustomobject]@{ Server = $srv; Lobby = $lob; Members = (New-Object Collections.ArrayList) } }
+        if (-not $locs[$key].Lobby -and $lob) { $locs[$key].Lobby = $lob }
+        [void]$locs[$key].Members.Add($m)
+    }
+    return [pscustomobject]@{ Locs = @($locs.Values); Others = @($others); Count = $members.Count }
+}
+
+# Lo que se muestra de un lugar, juntando la sala (Steam) y la respuesta del server
+function Get-WhereCardData($loc) {
+    $ld = $null
+    if ($loc.Lobby -and $script:steamNow.lobbies) { $pr = $script:steamNow.lobbies.PSObject.Properties[$loc.Lobby]; if ($pr) { $ld = $pr.Value } }
+    $info = if ($loc.Server) { $script:whereInfo[$loc.Server] } else { $null }
+    $camp = ''; $ldTitle = ''; $ldMap = ''
+    if ($ld) {
+        $raw = [string]$ld.campaign
+        $camp = if ($raw -match '^L4D2C(\d+)$' -and $campaigns.Contains("c$($Matches[1])")) { "c$($Matches[1])" } else { 'custom' }
+        $chapter = [int]$ld.chapter; if ($chapter -le 0) { $chapter = 1 }
+        $nm = if ($camp -ne 'custom') { $campaigns[$camp] } elseif ($ld.title -and -not ([string]$ld.title).StartsWith('#')) { [string]$ld.title } else { $raw }
+        $ldTitle = "$nm  ·  Capítulo $chapter"
+        $ldMap = if ($camp -ne 'custom') { $camp } else { $raw.ToLower() }
+    }
+    $map = ''; $title = ''; $sub = ''
+    if ($info -and $info.Map) {
+        $map = [string]$info.Map; $title = Get-MapTitle $map
+        if ($title -eq $map -and $ldTitle) { $title = $ldTitle }
+        $sub = [string]$info.Name
+    } elseif ($ldTitle) { $title = $ldTitle; $map = $ldMap }
+    else { $title = if ($loc.Server) { 'Entrando al server...' } else { 'Sala de espera' } }
+    if (-not $sub) { $sub = if ($loc.Server) { $loc.Server } else { 'Sala de espera' } }
+    $ws = if ($ld) { ConvertFrom-HexId ([string]$ld.ws) } else { '' }
+    $isCustom = if ($ld) { $camp -eq 'custom' } elseif ($map) { (Get-CampaignKey $map) -eq 'custom' } else { $false }
+
+    $chips = New-Object Collections.ArrayList
+    $inGame = [bool]$loc.Server -or ($ld -and $ld.state -eq 'game')
+    [void]$chips.Add(@($(if ($inGame) { 'EN PARTIDA' } else { 'EN LA SALA' }), $(if ($inGame) { $C.Green } else { $C.Blue }), $C.Bg))
+    if ($ld) {
+        switch ([string]$ld.access) {
+            'public' { [void]$chips.Add(@('PÚBLICA', $C.CardHi, $C.Dim)) }
+            'friends' { [void]$chips.Add(@('SOLO AMIGOS', $C.CardHi, $C.Orange)) }
+            'private' { [void]$chips.Add(@('PRIVADA', $C.CardHi, $C.Orange)) }
+        }
+    }
+    $official = ($ld -and $ld.server -eq 'official') -or ($info -and ([string]$info.Name) -like 'Valve Left4Dead 2*')
+    if ($official) { [void]$chips.Add(@('OFICIAL VALVE', $C.CardHi, $C.Dim)) }
+    if ($isCustom) { [void]$chips.Add(@('MAPA CUSTOM', $C.CardHi, $C.Amber)) }
+
+    $humans = 0; $max = 0
+    if ($info -and $info.MaxPlayers) { $humans = [int]$info.Players; $max = [int]$info.MaxPlayers }
+    elseif ($ld -and [int]$ld.slots) { $humans = [int]$ld.players; $max = [int]$ld.slots }
+    $here = @($loc.Members | Where-Object { $_.Sid -eq $script:me }).Count -gt 0
+    $link = if ($here) { '' } elseif ($loc.Lobby) { "steam://joinlobby/550/$($loc.Lobby)" } else { "steam://connect/$($loc.Server)" }
+    $ping = if ($info -and $null -ne $info.Ping) { [int]$info.Ping } else { $null }
+    return [pscustomobject]@{
+        Title = $title; Sub = $sub; Map = $map; WorkshopId = $ws; Custom = $isCustom; Chips = @($chips)
+        Members = @($loc.Members); Humans = $humans; Max = $max; Ping = $ping; Link = $link; Here = $here
+    }
+}
+
+function New-WhereCard($d) {
+    $W = Get-CardWidth; $H = 112
+    # Distinta a las de la lista a simple vista: fondo cálido (como el del líder), marco verde si estás ahí o
+    # ámbar si no, y las caras del grupo arriba de la imagen del mapa
+    $bg = RGB 52 40 27
+    $edge = if ($d.Here) { $C.Green } else { $C.Amber }
+    $card = New-Object L4dCard
+    $card.Size = New-Object Drawing.Size($W, $H); $card.BackColor = $bg
+    $strip = New-Object Windows.Forms.Panel
+    $strip.BackColor = $edge; $strip.Location = New-Object Drawing.Point(0, 0); $strip.Size = New-Object Drawing.Size(4, $H)
+
+    $pic = New-Object Windows.Forms.PictureBox
+    $pic.Location = New-Object Drawing.Point(4, 0); $pic.Size = New-Object Drawing.Size(200, $H); $pic.BackColor = $bg
+    $img = $null
+    if ($d.Map) {
+        if ($d.Custom) {
+            $id = if ($d.WorkshopId) { $d.WorkshopId } else { Get-CustomWorkshopId $script:customIx $d.Map }
+            if ($id) { $img = Get-MapImage "ws_$id" }
+            if (-not $img) { $img = Get-MapImage $d.Map }
+            if (-not $img) { $img = Get-MapImage 'addon' }
+        } else { $img = Get-MapImage $d.Map }
+    }
+    if ($img) { $pic.Image = Get-CardThumb $img 200 $H $bg }
+
+    $x = 222; $rightW = 320; $midW = $W - $x - $rightW - 10
+    $t = New-Text (Get-UiText $d.Title) $F.H $C.Text
+    $t.Location = New-Object Drawing.Point($x, 8)
+    $sub = New-Text $d.Sub $F.Body $C.Dim
+    $sub.AutoSize = $false; $sub.AutoEllipsis = $true
+    $sub.Location = New-Object Drawing.Point($x, 36); $sub.Size = New-Object Drawing.Size($midW, 20)
+    $chips = New-Object Windows.Forms.FlowLayoutPanel
+    $chips.BackColor = [Drawing.Color]::Transparent; $chips.WrapContents = $false
+    $chips.Location = New-Object Drawing.Point($x, 58); $chips.Size = New-Object Drawing.Size($midW, 22)
+    foreach ($ch in $d.Chips) { $chips.Controls.Add((New-Chip $ch[0] $ch[1] $ch[2])) }
+
+    # Quiénes están acá: avatar y nombre (el líder en ámbar)
+    $who = New-Object Windows.Forms.FlowLayoutPanel
+    $who.BackColor = [Drawing.Color]::Transparent; $who.WrapContents = $false
+    $who.Location = New-Object Drawing.Point($x, 84); $who.Size = New-Object Drawing.Size($midW, 24)
+    foreach ($m in $d.Members) {
+        $av = New-Object Windows.Forms.PictureBox
+        $av.Size = New-Object Drawing.Size(20, 20); $av.SizeMode = 'Zoom'; $av.Margin = New-Object Windows.Forms.Padding(0, 1, 0, 0)
+        $av.Image = if ($script:avatars[$m.Sid]) { $script:avatars[$m.Sid] } else { New-AvatarImage $m.Name }
+        $nm = New-Text $m.Name $F.Small $(if ($m.Leader) { $C.Amber } else { $C.Text })
+        $nm.Margin = New-Object Windows.Forms.Padding(4, 3, 12, 0)
+        $who.Controls.AddRange(@($av, $nm))
+    }
+
+    $keep = @()
+    $ctls = @($strip, $pic, $t, $sub, $chips, $who)
+    $slotX = $W - 176 - 132
+    if ($d.Max -gt 0) {
+        $free = [math]::Max(0, $d.Max - $d.Humans)
+        $slots = New-Text "$($d.Humans)/$($d.Max)" $F.Slots $C.Text
+        $slots.AutoSize = $false; $slots.TextAlign = 'MiddleCenter'
+        $slots.Size = New-Object Drawing.Size(120, 46); $slots.Location = New-Object Drawing.Point($slotX, 10)
+        $pips = New-Object Windows.Forms.PictureBox
+        $pips.Size = New-Object Drawing.Size(120, 12); $pips.Location = New-Object Drawing.Point($slotX, 60)
+        $pips.BackColor = $bg; $pips.Image = Get-SlotPips $d.Humans $d.Max $C.Green $bg
+        $freeText = switch ($free) { 0 { 'Lleno' } 1 { 'Queda 1' } default { "Quedan $free" } }
+        $slotsSub = New-Text (Get-UiText $freeText) $F.SlotsSub $(if ($free) { $C.Green } else { $C.Orange })
+        $slotsSub.AutoSize = $false; $slotsSub.TextAlign = 'MiddleCenter'
+        $slotsSub.Size = New-Object Drawing.Size(120, 20); $slotsSub.Location = New-Object Drawing.Point($slotX, 78)
+        $ctls += @($slots, $pips, $slotsSub)
+    }
+    if ($null -ne $d.Ping) {
+        $ping = New-Text "$($d.Ping) ms" $F.Ping (Get-PingColor $d.Ping)
+        $ping.AutoSize = $false; $ping.TextAlign = 'MiddleRight'
+        $ping.Size = New-Object Drawing.Size(160, 26); $ping.Location = New-Object Drawing.Point(($W - 176), 8)
+        $ctls += $ping
+    }
+    if ($d.Here) {
+        $hereLbl = New-Text (Get-UiText 'Estás acá') $F.Btn $C.Green
+        $hereLbl.AutoSize = $false; $hereLbl.TextAlign = 'MiddleCenter'
+        $hereLbl.Size = New-Object Drawing.Size(160, 34); $hereLbl.Location = New-Object Drawing.Point(($W - 176), 44)
+        $ctls += $hereLbl
+    } elseif ($d.Link) {
+        $join = New-FlatButton (Get-UiText 'Unirme') $C.Accent $C.AccentHi 160 34
+        $join.Location = New-Object Drawing.Point(($W - 176), 44); $join.Tag = $d.Link
+        $join.add_Click({ Invoke-Join $this.Tag })
+        $ctls += $join; $keep += $join
+    }
+    $card.Controls.AddRange([Windows.Forms.Control[]]$ctls)
+    $faces = @($d.Members | ForEach-Object { if ($script:avatars[$_.Sid]) { $script:avatars[$_.Sid] } else { New-AvatarImage $_.Name } })
+    Convert-CardToImage $card $keep {
+        param($g, $w, $h)
+        # Marco de 2 px alrededor de toda la tarjeta
+        $pen = New-Object Drawing.Pen($edge, 2)
+        $g.SmoothingMode = 'None'
+        $g.DrawRectangle($pen, 1, 1, ($w - 2), ($h - 2))
+        $g.SmoothingMode = 'AntiAlias'
+        # Caras del grupo sobre la imagen, abajo a la izquierda (con borde del color del marco)
+        $sz = 30; $fx = 12; $fy = $h - $sz - 10
+        foreach ($img in ($faces | Select-Object -First 5)) {
+            $g.FillRectangle((New-Object Drawing.SolidBrush($edge)), ($fx - 2), ($fy - 2), ($sz + 4), ($sz + 4))
+            $g.DrawImage($img, $fx, $fy, $sz, $sz)
+            $fx += $sz + 6
+        }
+    }
+    return $card
+}
+
+function Show-Where {
+    $data = Get-WhereData
+    $show = $data -and ($data.Locs.Count -gt 0 -or $data.Count -gt 1)
+    # Servers a consultar (si cambiaron, ya mismo; después cada 15 s)
+    $addrs = if ($show) { @($data.Locs | Where-Object { $_.Server } | ForEach-Object { $_.Server }) } else { @() }
+    $addrKey = $addrs -join ','
+    if ($addrKey -ne $script:whereAddrs) { $script:whereAddrs = $addrKey; if ($addrs.Count) { Request-WhereInfo } }
+    if ($addrs.Count) { if (-not $whereTimer.Enabled) { $whereTimer.Start() } } else { $whereTimer.Stop() }
+
+    $cards = if ($show) { @($data.Locs | ForEach-Object { Get-WhereCardData $_ }) } else { @() }
+    $key = if ($show) {
+        "$(Get-CardWidth)|" + (($cards | ForEach-Object {
+                    "$($_.Title)~$($_.Sub)~$($_.Map)~$($_.Humans)/$($_.Max)~$($_.Ping)~$($_.Link)~$($_.Here)~" +
+                    (($_.Chips | ForEach-Object { $_[0] }) -join '+') + '~' + (($_.Members | ForEach-Object { "$($_.Name):$($_.Leader):$([bool]$script:avatars[$_.Sid])" }) -join '+')
+                }) -join '||') + '|' + ($data.Others -join ';')
+    } else { '' }
+    if ($key -eq $script:whereKey) { return }
+    $script:whereKey = $key
+
+    Invoke-Frozen {
+        $old = @($wherePanel.Controls); $wherePanel.Controls.Clear(); foreach ($ctl in $old) { $ctl.Dispose() }
+        if (-not $show) { $wherePanel.Visible = $false; return }
+        $y = 8
+        $cap = New-Text (Get-UiText 'Dónde está tu grupo') $F.Btn $C.Amber
+        $cap.Location = New-Object Drawing.Point(16, $y); $wherePanel.Controls.Add($cap)
+        $y += 26
+        foreach ($d in $cards) {
+            $cardCtl = New-WhereCard $d
+            $cardCtl.Location = New-Object Drawing.Point(16, $y)
+            $wherePanel.Controls.Add($cardCtl)
+            $y += $cardCtl.Height + 8
+        }
+        if ($data.Others.Count) {
+            $o = New-Text ($data.Others -join '    ·    ') $F.Small $C.Dim
+            $o.Location = New-Object Drawing.Point(18, $y); $wherePanel.Controls.Add($o)
+            $y += 22
+        }
+        $wherePanel.Height = $y + 6
+        $line = New-Object Windows.Forms.Panel
+        $line.BackColor = RGB 74 58 36; $line.Height = 2; $line.Dock = 'Bottom'
+        $wherePanel.Controls.Add($line)
+        $wherePanel.Visible = $true
+    }
+}
+
+# Mapa, nombre y jugadores de los servers donde está el grupo (consulta directa, sin Steam ni internet extra)
+function Request-WhereInfo {
+    $addrs = @($script:whereAddrs -split ',' | Where-Object { $_ })
+    if (-not $addrs.Count -or $script:busy['whereinfo']) { return }
+    Start-Async 'whereinfo' {
+        param($finder, $addrs)
+        $src = [IO.File]::ReadAllText($finder)
+        $a = $src.IndexOf('# >>> BUSQUEDA'); $b = $src.IndexOf('# <<< BUSQUEDA')
+        . ([scriptblock]::Create($src.Substring($a, $b - $a)))
+        Invoke-InfoScan $addrs 40 1500
+    } @((Join-Path $here 'finder.ps1'), [string[]]$addrs) {
+        param($res, $err)
+        foreach ($i in @($res)) { if ($i -and $i.Addr) { $script:whereInfo[[string]$i.Addr] = $i } }
+        Update-Where
+    }
+}
+
 
 # ---------------- seguir ----------------
 # Se revisa con cada aviso del vigía. Un destino nuevo se confirma a los 2 s con un único temporizador.
@@ -2044,7 +2332,7 @@ $form.add_FormClosing({
         if ($script:friendsWatcher) { $script:friendsWatcher.EnableRaisingEvents = $false }
         if ($script:watch) { try { $script:watch.Proc.Kill() } catch {} }
         Write-AppLog '=== App cerrada'
-        $pumpTimer.Stop(); $beatTimer.Stop()
+        $pumpTimer.Stop(); $beatTimer.Stop(); $whereTimer.Stop()
         # Avisar que cerraste la app: salís del grupo para los demás (si no llega, vence a los 10 min)
         if ($script:me -and -not $Screenshot) { try { Send-FollowSignal $script:me '' -Closed } catch {} }
         $settings.Share = $chkShare.Checked
@@ -2105,6 +2393,28 @@ if ($Screenshot) {
     $form.add_Shown({
             # Prueba del grupo sin tocar a nadie: L4D2_FAKE_PARTY=1 arma un grupo con tus 2 primeros amigos
             # (el primero de líder, vos siguiéndolo) y saca también una captura del menú de amigos
+            # Prueba de "Dónde están": L4D2_FAKE_WHERE=1 arma un grupo con 2 amigos y finge que vos y el
+            # líder están en un server oficial real y el otro en una sala de espera
+            if ($env:L4D2_FAKE_WHERE) {
+                $fakeW = New-Object Windows.Forms.Timer
+                $fakeW.Interval = 2500
+                $fakeW.add_Tick({
+                        if (-not $script:friendByHash.Count) { return }
+                        $this.Stop()
+                        $fr = @($script:friendByHash.Values | Where-Object { [string]$_.SteamId -ne $script:me } | Sort-Object Name | Select-Object -First 2)
+                        $script:groupLeader = [string]$fr[0].SteamId
+                        $script:partyMap = @{ $fr[0].Hash = ''; $fr[1].Hash = $fr[0].Hash }
+                        $script:groupKey = $null; Update-Group; Update-FollowButtons
+                        $srv = if ($env:L4D2_FAKE_WHERE -match ':') { $env:L4D2_FAKE_WHERE } else { '155.133.244.69:27015' }
+                        $script:steamNow = ('{"me":{"server":"' + $srv + '","lobby":"111","playing":true},"friends":[' +
+                            '{"id":"' + $fr[0].SteamId + '","name":"x","server":"' + $srv + '","lobby":"111"},' +
+                            '{"id":"' + $fr[1].SteamId + '","name":"y","server":"","lobby":"222"}],' +
+                            '"lobbies":{"111":{"campaign":"L4D2C1","chapter":"2","state":"game","players":"7","slots":"8","access":"public","server":"official","mode":"versus","title":"","ws":"0"},' +
+                            '"222":{"campaign":"L4D2C5","chapter":"1","state":"lobby","players":"3","slots":"8","access":"friends","server":"listen","mode":"versus","title":"","ws":"0"}}}') | ConvertFrom-Json
+                        Update-Where
+                    })
+                $fakeW.Start()
+            }
             if ($env:L4D2_FAKE_PARTY) {
                 $fake = New-Object Windows.Forms.Timer
                 $fake.Interval = 2500

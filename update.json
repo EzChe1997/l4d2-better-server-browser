@@ -1,12 +1,12 @@
 {
-    "version":  6,
-    "notes":  "Cambio de pestaña sin parpadeo, scroll sin rayas (también maximizada), arreglo del error de BackColor y acceso directo con el ícono de la app",
-    "date":  "2026-11-13 13:38",
+    "version":  7,
+    "notes":  "Nueva sección Dónde está tu grupo (server/sala de cada uno en tiempo real) y Unirme trae el juego al frente",
+    "date":  "2026-11-13 19:35",
     "files":  {
-                  "finder.ps1":  "d4b9381edd5dc2738bbba955f7693f3577b7f34732003c57f4603a4b63628d4e",
-                  "ui.ps1":  "4d76668d8781a8c337523021224d368dce6b4a9d2bd374082a24ddf61fe91fb0",
+                  "finder.ps1":  "aa3d8a66f7a34caee3313adb1ad4968084544d71c58f40368eecf8d7751dfb2b",
+                  "ui.ps1":  "18e84b086933739d06bd007e79515ba854018d0516867ac3467173a7a9677d05",
                   "vpk.ps1":  "a33358afe20ca8d31901f90d36340322c476b68899215d26a9ee91daad9d40c5",
-                  "lobbies.ps1":  "ce492d3df6a5688f9c643eb48c9da33c432c87ad2c43953e456f61645c7817ca",
+                  "lobbies.ps1":  "66c8f07df1ceb98141def164e157a461f14fe88b4e13b571ca205ceb490d6125",
                   "Buscar versus.bat":  "608546897db095fcb0bc007ee31048185cddc1d8862f04cc2a74e0318628fcb6"
               }
 }
