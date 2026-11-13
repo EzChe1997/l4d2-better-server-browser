@@ -28,7 +28,7 @@ $keyFile = Join-Path $here 'apikey.txt'
 # ======================= actualizaciones automaticas =======================
 # La app se fija si hay una version nueva publicada en GitHub. El indice (update.json) va firmado
 # con una clave que solo tiene quien publica: si la firma no coincide, la actualizacion se ignora.
-$AppVersion = 2
+$AppVersion = 3
 $updateBase = 'https://raw.githubusercontent.com/EzChe1997/l4d2-better-server-browser/main'   # lo completa publicar.ps1 (https://raw.githubusercontent.com/<usuario>/<repo>/main)
 $updatePublicKey = '<RSAKeyValue><Modulus>3uVFz1ZH9ed0Zun/YcmPi4gk8EALr+R7/DYQY+Fz5NArgRYEo1iNfjNpBUn7G3R0Tliw5DjecmnM0/InLrFLJl2BgMmwJo0VBw4BJ/7qmQm1q7oJoZ0mjI8cgxynbgyhARnQY3i9lVnEGfwB3IOnYhire7XM6iFxui9b5fOd3npzorhJakLqdMdPLBc7BT5VE8E/MfeyhlhusGlKpgsB4QWY3U8WufkkE81E5bziCI1m3RYYUVeoqGukzfujshi2OwV9EBpAIWgDmdZNA3UBDwd6Q0ocq2/EvPfzzNZgNbeQObT+DutokxYEz2e8DlZU0ek46JsxTOFQShlNKoOeHUiXMfjfwUc3j6KqYRNUF1VV9xOzML2W9/+l73r6SnmrPVMItghOEzVivQgZ6gtk3Y901stV4yxTB+RFXO89EFbGYF4C2zhGvdssKxuWibjan9P5D6f/00E6uAb4ehy5MT5Cfj7Iy0Wqo8AmKTOFWOJU8BOjDOu7Odbgi8Xs6dNp</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>'
 $updateFiles = @('finder.ps1', 'ui.ps1', 'vpk.ps1', 'lobbies.ps1', 'Buscar versus.bat')
@@ -68,6 +68,7 @@ function Install-Update([string]$base, [string]$pubKey, [int]$current, [string]$
     return [pscustomobject]@{ Version = [int]$man.version; Notes = [string]$man.notes }
 }
 
+# >>> BUSQUEDA (desde aca hasta <<< BUSQUEDA lo carga tambien el hilo de fondo de la ventana)
 # ======================= protocolo de consultas de Steam (A2S) =======================
 class PacketReader {
     [byte[]]$D
@@ -283,7 +284,8 @@ function Get-CampaignKey([string]$map) {
 # ======================= salas de espera (lobbies de Steam) =======================
 # La Web API no lista lobbies: lobbies.ps1 los pide al cliente de Steam usando el steam_api.dll
 # del juego (32 bits), en un PowerShell de 32 bits aparte. No necesita API key.
-function Get-LobbyJson([int]$party, [string]$dir) {
+# Arranca lobbies.ps1 sin esperarlo (Receive-LobbyHelper junta la respuesta)
+function Start-LobbyHelper([string]$dir, [string]$helperArgs) {
     $game = Find-L4D2Path
     if (-not $game) { throw 'No encuentro Left 4 Dead 2 instalado.' }
     $dll = Join-Path $game 'bin\steam_api.dll'
@@ -291,18 +293,63 @@ function Get-LobbyJson([int]$party, [string]$dir) {
     $ps32 = Join-Path $env:WINDIR 'SysWOW64\WindowsPowerShell\v1.0\powershell.exe'
     if (-not (Test-Path $ps32)) { $ps32 = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe' }   # Windows de 32 bits
     $psi = New-Object Diagnostics.ProcessStartInfo $ps32
-    # Pedido extra: todas las salas versus con campaña custom del mundo (son pocas y quedan fuera de las 50 cercanas).
-    # Sirven para mostrarlas y para aprender qué campaña de la Workshop es cada mapa custom.
-    $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Dll "{1}" -Slots {2} -Filter "Game:mode=versus,Game:state=lobby,System:access=public" -ExtraFilter "Game:mode=versus,Game:MissionInfo:BuiltIn=0"' -f (Join-Path $dir 'lobbies.ps1'), $dll, $party
+    $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Dll "{1}" {2}' -f (Join-Path $dir 'lobbies.ps1'), $dll, $helperArgs
     $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
     $proc = [Diagnostics.Process]::Start($psi)
-    $out = $proc.StandardOutput.ReadToEndAsync(); $errText = $proc.StandardError.ReadToEndAsync()
-    if (-not $proc.WaitForExit(45000)) { try { $proc.Kill() } catch {}; throw 'Steam tardó demasiado en responder.' }
-    $text = $out.Result.Trim()
+    return @{ Proc = $proc; Out = $proc.StandardOutput.ReadToEndAsync(); Err = $proc.StandardError.ReadToEndAsync() }
+}
+
+function Receive-LobbyHelper($h) {
+    if (-not $h.Proc.WaitForExit(45000)) { try { $h.Proc.Kill() } catch {}; throw 'Steam tardó demasiado en responder.' }
+    $text = $h.Out.Result.Trim()
     if ($text -like 'ERROR:*') { throw $text.Substring(6).Trim() }
-    if (-not $text.StartsWith('[')) { throw "No pude leer las salas de Steam. $($errText.Result.Trim())" }
+    if (-not $text.StartsWith('[')) { throw "No pude leer las salas de Steam. $($h.Err.Result.Trim())" }
     return $text
+}
+
+function Get-LobbyJson([int]$party, [string]$dir) {
+    # Pedido extra: todas las salas versus con campaña custom del mundo (son pocas y quedan fuera de las 50 cercanas).
+    # Sirven para mostrarlas y para aprender qué campaña de la Workshop es cada mapa custom.
+    Receive-LobbyHelper (Start-LobbyHelper $dir ('-Slots {0} -Filter "Game:mode=versus,Game:state=lobby,System:access=public" -ExtraFilter "Game:mode=versus,Game:MissionInfo:BuiltIn=0"' -f $party))
+}
+
+# Partidas ya empezadas en servers oficiales de Valve con sala PUBLICA (Steam solo lista las publicas).
+# Un pedido por campaña (y por capitulo en las mas jugadas) porque cada pedido trae 50 como mucho.
+function Start-OfficialGamesHelper([string]$dir) {
+    $passes = foreach ($n in 1..14) {
+        if ($n -in 1, 2, 5) { foreach ($ch in 1..5) { "1|0|Game:state=game,Options:server=official,Game:campaign=L4D2C$n,Game:chapter=$ch" } }
+        else { "1|0|Game:state=game,Options:server=official,Game:campaign=L4D2C$n" }
+    }
+    Start-LobbyHelper $dir ('-Passes "{0}"' -f ($passes -join ';'))
+}
+
+# Une cada sala publica con un server oficial de la lista (misma campaña y capitulo, ~misma gente).
+# Devuelve addr -> modo de la sala. Los oficiales con gente que no quedan unidos a ninguna sala
+# casi seguro son de "solo amigos" o privados: conectarse directo te mete igual.
+function Get-OfficialLobbyMatch($servers, [string]$json) {
+    $lobbies = @(($json | ConvertFrom-Json) | ForEach-Object { $_ } | Where-Object {
+            [int]$_.'Members:numPlayers' -lt 99 -and [string]$_.'Game:campaign' -match '^L4D2C\d+$' })
+    $pairs = foreach ($l in $lobbies) {
+        $camp = ([string]$l.'Game:campaign').Substring(4).ToLower()   # L4D2C5 -> c5
+        $ch = [int]$l.'Game:chapter'
+        $n = [math]::Max([int]$l.'Members:numPlayers', [int]$l._members)
+        foreach ($s in $servers) {
+            if ($s.Map -notmatch '^(c\d+)m(\d+)_' -or $Matches[1] -ne $camp -or [int]$Matches[2] -ne $ch) { continue }
+            $diff = [math]::Abs($s.Humans - $n)
+            if ($diff -le 1) { [pscustomobject]@{ Addr = $s.Addr; Lobby = [string]$l._id; Mode = [string]$l.'Game:mode'; Diff = $diff; Ping = $s.Ping } }
+        }
+    }
+    # Primero las salas versus; las mutaciones de versus solo con los servers que sobran
+    # (las de coop no: esos servers se anuncian como coop y ni estan en la lista)
+    $versusMutations = 'mutation12', 'mutation15', 'mutation18', 'mutation19', 'community3', 'community6'
+    $pairs = @($pairs | Where-Object { $_.Mode -eq 'versus' -or $versusMutations -contains $_.Mode })
+    $match = @{}; $usedLobby = @{}
+    foreach ($p in @($pairs | Sort-Object { [int]($_.Mode -ne 'versus') }, Diff, Ping)) {
+        if ($match.ContainsKey($p.Addr) -or $usedLobby.ContainsKey($p.Lobby)) { continue }
+        $match[$p.Addr] = $p.Mode; $usedLobby[$p.Lobby] = $true
+    }
+    return $match
 }
 
 # ======================= imagenes de mapas custom =======================
@@ -503,6 +550,12 @@ function Test-VersusServer([string]$tags, [string]$name) {
     return (-not $tags.Trim() -and $name -match '(?i)versus|zone\s*mod|zonepug|\bvs\b|\b\dv\d\b')
 }
 
+# Mutaciones y otros modos que tambien se anuncian como "versus": etiquetas de otro modo o nombre que lo dice
+function Test-MutationServer([string]$tags, [string]$name) {
+    if (",$tags," -match '(?i),(coop|realism|survival|scavenge|holdout|dash|shootzones|mutation\d*|community\d*),') { return $true }
+    return $name -match '(?i)realism|realista|mutaci[oó]n|mutation'
+}
+
 # Servers del historial y favoritos de Steam (ver > servidores): pueden no figurar en la lista publica
 function Get-HistoryServers {
     $me = Get-MySteamId
@@ -536,15 +589,21 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
     $hist = New-Object 'System.Collections.Generic.HashSet[string]'
     foreach ($a in (Get-HistoryServers)) { if (-not $listed.Contains($a)) { [void]$hist.Add($a) } }
     $addrs = @($pre | ForEach-Object { $_.addr }) + @($hist)
+    # Mientras se mide el ping, pedirle a Steam las salas publicas de partidas en servers oficiales
+    $offHelper = $null
+    try { $offHelper = Start-OfficialGamesHelper $here } catch {}
     & $OnStatus "Midiendo ping de $($addrs.Count) servers versus con lugar..."
-    $infos = @(Invoke-InfoScan $addrs)
+    # Espera por tanda segun el ping maximo: hacen falta 2 idas y vueltas (desafio + respuesta).
+    # Lo que conteste mas tarde igual quedaria afuera por ping.
+    $wait = [math]::Min(900, 2 * $maxPing + 250)
+    $infos = @(Invoke-InfoScan $addrs 40 $wait)
     # Reintento con mas espera para los que no contestaron (paquetes perdidos o servers lentos)
     $answered = New-Object 'System.Collections.Generic.HashSet[string]'
     foreach ($i in $infos) { [void]$answered.Add($i.Addr) }
     $retry = @($addrs | Where-Object { -not $answered.Contains($_) })
     if ($retry.Count) {
         & $OnStatus "Reintentando $($retry.Count) servers que no contestaron..."
-        $infos += @(Invoke-InfoScan $retry 20 1500)
+        $infos += @(Invoke-InfoScan $retry 40 ([math]::Min(1500, 2 * $wait)))
     }
     $near = @($infos | Where-Object {
             $_.Ping -le $maxPing -and $_.Password -eq 0 -and (Test-VersusServer "$($_.Tags)" "$($_.Name)") -and $_.Players -gt 0 -and
@@ -560,8 +619,27 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
         $rules = Invoke-RulesScan $competitiveAddrs
     }
 
+    # Oficiales de Valve: cual tiene sala publica (y de que modo). Si Steam no contesta, no se marca nada.
+    $offMatch = $null
+    if ($offHelper) {
+        & $OnStatus 'Revisando cuáles partidas oficiales son públicas...'
+        try {
+            $valveNear = @($near | Where-Object { $_.Name -like 'Valve Left4Dead 2*' } | ForEach-Object {
+                    $n = if ($players.ContainsKey($_.Addr)) { @($players[$_.Addr]).Count } else { 0 }
+                    [pscustomobject]@{ Addr = $_.Addr; Map = $_.Map; Ping = $_.Ping; Humans = [math]::Max($_.Players, $n) } })
+            $offMatch = Get-OfficialLobbyMatch $valveNear (Receive-LobbyHelper $offHelper)
+        } catch { $offMatch = $null }
+    }
+
     $rows = foreach ($s in $near) {
         $pl = if ($players.ContainsKey($s.Addr)) { $players[$s.Addr] } else { @() }
+        $isValve = $s.Name -like 'Valve Left4Dead 2*'
+        $mutation = Test-MutationServer "$($s.Tags)" "$($s.Name)"
+        $friendsOnly = $false
+        if ($isValve -and $null -ne $offMatch) {
+            if (-not $offMatch.ContainsKey($s.Addr)) { $friendsOnly = $true }
+            elseif ($offMatch[$s.Addr] -ne 'versus') { $mutation = $true }
+        }
 
         # Config competitiva: la variable del server; si no la publica, el nombre del server.
         $cfg = if ($rules.ContainsKey($s.Addr)) { "$($rules[$s.Addr])" } else { '' }
@@ -587,7 +665,8 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
         $premade = if ($groups.Count -gt 0 -and $groups[0] -ge 3 -and $groups[0] -le $teamSize) { [int]$groups[0] } else { 0 }
         $hint = $v.Hint
         if ($premade) { $hint += " | grupo armado de $premade" }
-        if ($s.Name -like 'Valve Left4Dead 2*') { $hint += ' | oficial de Valve: puede rechazar la conexion directa' }
+        if ($friendsOnly) { $hint += ' | sin sala pública: probablemente de solo amigos' }
+        if ($mutation) { $hint += ' | mutación u otro modo' }
         if ($effMax -gt 8) { $hint += " | server grande ($effMax)" }
         if ($hist.Contains($s.Addr)) { $hint += ' | de tu historial de Steam' }
         [pscustomobject]@{
@@ -595,7 +674,7 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
             Jugadores = "$h/$effMax"; Nombre = $s.Name; Mapa = $s.Map
             Pista = $hint; Addr = $s.Addr
             Hint = $v.Hint; Valve = ($s.Name -like 'Valve Left4Dead 2*'); Max = $effMax; Humans = $h
-            Premade = $premade
+            Premade = $premade; FriendsOnly = $friendsOnly; Mutation = $mutation
             Campaign = (Get-CampaignKey $s.Map); Config = $cfg; Competitive = $competitive; ZoneMod = $zoneMod; Team = $team
         }
     }
@@ -603,6 +682,7 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
     & $OnStatus ("Listo: {0} servers ({1} seguros). {2:HH:mm}" -f $rows.Count, @($rows | Where-Object { $_.Rank -eq 0 }).Count, (Get-Date))
     return $rows
 }
+# <<< BUSQUEDA
 
 # ======================= modo grupo (avisos por ntfy.sh) =======================
 # Solo viaja la IP del server elegido, tu nombre y un id al azar de esta instalacion.
@@ -611,7 +691,7 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
 $settingsFile = Join-Path $here 'settings.json'
 
 function Get-Settings {
-    $s = [ordered]@{ Name = $env:USERNAME; Group = ''; Party = 2; MaxPing = 150; Follow = $false; AutoRefresh = $false; Campaigns = @(); ServerType = 'Todos'; LobbyType = 'Todas'; View = 'servers'; FollowSteamId = ''; SteamFollow = $false; Share = $true; ClientId = [guid]::NewGuid().ToString('N') }
+    $s = [ordered]@{ Name = $env:USERNAME; Group = ''; Party = 2; MaxPing = 150; Follow = $false; AutoRefresh = $false; Campaigns = @(); ServerType = ''; LobbyType = ''; ModeFilter = $null; HostFilter = $null; IncludeFriendsOnly = $false; IncludeMutations = $false; FollowKey = 'F5'; View = 'servers'; FollowSteamId = ''; SteamFollow = $false; Share = $true; ClientId = [guid]::NewGuid().ToString('N') }
     if (Test-Path $settingsFile) {
         try {
             $saved = Get-Content $settingsFile -Raw -Encoding UTF8 | ConvertFrom-Json

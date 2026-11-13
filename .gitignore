@@ -6,3 +6,6 @@ update-tmp/
 *.zip
 probe.ps1
 resultado-*.txt
+
+eventos.log
+eventos.anterior.log

@@ -1,4 +1,4 @@
-# lobbies.ps1 - pide a Steam la lista de salas de espera (lobbies) publicas de L4D2.
+﻿# lobbies.ps1 - pide a Steam la lista de salas de espera (lobbies) publicas de L4D2.
 # La Web API de Steam no lista lobbies: solo se puede desde un programa conectado al cliente de
 # Steam como si fuera el juego. Para eso usa el steam_api.dll del propio L4D2 (32 bits), asi que
 # corre con el PowerShell de 32 bits (finder.ps1 lo lanza solo):
@@ -11,6 +11,9 @@ param(
     [string]$Distance = '1,3',   # 1 = region cercana, 2 = lejos, 3 = todo el mundo (en orden)
     [string]$AppId = '550',
     [string[]]$ExtraFilter = @(),   # un pedido mas, mundial y sin minimo de lugares (p. ej. salas custom)
+    # Varios pedidos sueltos en una sola corrida: "distancia|lugares|k=v,k=v;distancia|lugares|k=v..."
+    # (reemplaza a Filter/Slots/Distance/ExtraFilter). Cada lobby trae _pass con el numero de pedido.
+    [string]$Passes = '',
     [switch]$Dump
 )
 
@@ -19,14 +22,14 @@ if ([IntPtr]::Size -ne 4) { throw 'Hay que correrlo con PowerShell de 32 bits' }
 $env:SteamAppId = $AppId
 $env:SteamGameId = $AppId
 
-if (-not ('L4dLobbies' -as [type])) {
+if (-not ('L4dLobbies2' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
 using System.Text;
 using System.Runtime.InteropServices;
 using System.Collections.Generic;
 
-public static class L4dLobbies {
+public static class L4dLobbies2 {
     [DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr LoadLibraryW(string path);
     [DllImport("kernel32", CharSet = CharSet.Ansi)] static extern IntPtr GetProcAddress(IntPtr h, string name);
 
@@ -51,7 +54,8 @@ public static class L4dLobbies {
         return Marshal.GetDelegateForFunctionPointer(p, typeof(T)) as T;
     }
 
-    public static List<Dictionary<string, string>> Fetch(string dll, string[] filters, int slots, int[] distances, string[] extra, int timeoutMs) {
+    // Un pedido por elemento: filtros "k=v,k=v", distancia, minimo de lugares y etiqueta (near/far/extra)
+    public static List<Dictionary<string, string>> Fetch(string dll, string[] passFilters, int[] passDist, int[] passSlots, string[] passTags, int timeoutMs) {
         h = LoadLibraryW(dll);
         if (h == IntPtr.Zero) throw new Exception("no pude cargar " + dll + " (error " + Marshal.GetLastWin32Error() + ")");
         if (!F<D_Init>("SteamAPI_Init")()) throw new Exception("No me pude conectar a Steam: tiene que estar abierto y con tu cuenta iniciada.");
@@ -77,15 +81,12 @@ public static class L4dLobbies {
 
             var list = new List<Dictionary<string, string>>();
             var seen = new HashSet<ulong>();
-            // Un pedido por distancia; y si hay filtros extra, uno mas en todo el mundo solo con esos
-            int passes = distances.Length + (extra.Length > 0 ? 1 : 0);
-            for (int di = 0; di < passes; di++) {
-                bool isExtra = di >= distances.Length;
+            for (int di = 0; di < passFilters.Length; di++) {
                 // Los filtros se reinician despues de cada pedido: hay que volver a ponerlos
-                distFilter(mm, isExtra ? 3 : distances[di]);
+                distFilter(mm, passDist[di]);
                 countFilter(mm, 50);
-                if (slots > 0 && !isExtra) slotFilter(mm, slots);
-                foreach (string fl in (isExtra ? extra : filters)) {
+                if (passSlots[di] > 0) slotFilter(mm, passSlots[di]);
+                foreach (string fl in passFilters[di].Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries)) {
                     int eq = fl.IndexOf('=');
                     if (eq > 0) strFilter(mm, fl.Substring(0, eq), fl.Substring(eq + 1), 0);   // 0 = igual a
                 }
@@ -115,8 +116,9 @@ public static class L4dLobbies {
                     d["_members"] = members(mm, id).ToString();
                     d["_limit"] = limit(mm, id).ToString();
                     d["_owner"] = owner(mm, id).ToString();
-                    d["_near"] = di == 0 ? "1" : "0";
-                    d["_extra"] = isExtra ? "1" : "0";
+                    d["_near"] = passTags[di] == "near" ? "1" : "0";
+                    d["_extra"] = passTags[di] == "extra" ? "1" : "0";
+                    d["_pass"] = di.ToString();
                     int n = dataCount(mm, id);
                     for (int k = 0; k < n; k++) {
                         var key = new StringBuilder(256); var val = new StringBuilder(8192);
@@ -132,9 +134,23 @@ public static class L4dLobbies {
 '@
 }
 
-$filters = [string[]]@($Filter | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
+$pf = @(); $pd = @(); $ps = @(); $pt = @()
+if ($Passes) {
+    foreach ($spec in ($Passes -split ';' | Where-Object { $_.Trim() })) {
+        $d, $s, $fl = $spec -split '\|', 3
+        $pf += "$fl"; $pd += [int]$d; $ps += [int]$s; $pt += 'pass'
+    }
+} else {
+    $base = (@($Filter | ForEach-Object { $_ -split ',' } | Where-Object { $_ })) -join ','
+    $first = $true
+    foreach ($d in ($Distance -split ',' | Where-Object { $_ })) {
+        $pf += $base; $pd += [int]$d; $ps += $Slots; $pt += $(if ($first) { 'near' } else { 'far' }); $first = $false
+    }
+    $extra = (@($ExtraFilter | ForEach-Object { $_ -split ',' } | Where-Object { $_ })) -join ','
+    if ($extra) { $pf += $extra; $pd += 3; $ps += 0; $pt += 'extra' }   # mundial y sin minimo de lugares
+}
 try {
-    $list = [L4dLobbies]::Fetch($Dll, $filters, $Slots, [int[]]@($Distance -split ',' | Where-Object { $_ } | ForEach-Object { [int]$_ }), [string[]]@($ExtraFilter | ForEach-Object { $_ -split ',' } | Where-Object { $_ }), 15000)
+    $list = [L4dLobbies2]::Fetch($Dll, [string[]]$pf, [int[]]$pd, [int[]]$ps, [string[]]$pt, 15000)
 } catch {
     $e = $_.Exception; while ($e.InnerException) { $e = $e.InnerException }
     [Console]::Out.Write("ERROR: $($e.Message)")

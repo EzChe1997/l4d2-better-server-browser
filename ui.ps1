@@ -13,6 +13,18 @@ $script:customIx = Get-CustomIndex $customFile
 $script:wsPending = @{}   # portadas que faltan bajar
 $script:wsTried = @{}     # ya intentadas en esta sesion (para no reintentar en bucle)
 
+# Registro de eventos (eventos.log, al lado de la app): que vio, que decidio y que ordenes le mando al juego.
+# Sirve para entender bugs que pasan jugando (p. ej. "me saco del server"). Se recorta solo al pasar 1 MB.
+$logFile = Join-Path $here 'eventos.log'
+function Write-AppLog([string]$msg) {
+    if ($Screenshot) { return }
+    try {
+        if ((Test-Path $logFile) -and (Get-Item $logFile).Length -gt 1MB) { Move-Item $logFile (Join-Path $here 'eventos.anterior.log') -Force }
+        [IO.File]::AppendAllText($logFile, "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $msg`r`n", (New-Object Text.UTF8Encoding($false)))
+    } catch {}
+}
+Write-AppLog "=== App abierta (v$AppVersion). Seguir=$([bool]$settings.SteamFollow) a $($settings.FollowSteamId); compartir=$([bool]$settings.Share)"
+
 # ---------------- trabajo en segundo plano ----------------
 # Todo lo que espera a internet o lee archivos grandes corre en otro hilo, asi la ventana
 # nunca queda "No responde". Cuando termina, el resultado se procesa en la ventana.
@@ -20,7 +32,7 @@ $iss = [Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
 foreach ($fn in 'Get-Topic', 'Get-SidHash', 'Send-SteamBroadcast', 'Receive-SteamBroadcasts', 'Get-SteamStatus',
     'Get-LocalFriends', 'Get-ApiKey', 'Find-L4D2Path', 'Read-VpkIndex', 'Read-VpkFile', 'Export-MapImages', 'Get-LobbyJson',
     'Receive-NtfyMessages', 'Send-FollowSignal', 'Get-GroupHashes', 'Get-SteamAvatars', 'Get-WorkshopImages', 'Get-InstalledAddonMaps',
-    'Install-Update') {
+    'Install-Update', 'Get-MySteamId') {
     $iss.Commands.Add((New-Object Management.Automation.Runspaces.SessionStateFunctionEntry($fn, (Get-Item "function:$fn").Definition)))
 }
 foreach ($v in 'presenceTopic', 'followTopic', 'keyFile') {
@@ -50,7 +62,9 @@ function Get-First($res) {
 
 $pumpTimer = New-Object Windows.Forms.Timer
 $pumpTimer.Interval = 150
+$script:searchState = $null
 $pumpTimer.add_Tick({
+        if ($script:busy['servers'] -and $script:searchState -and $status.Text -ne $script:searchState.Msg) { $status.Text = $script:searchState.Msg }
         for ($i = $script:jobs.Count - 1; $i -ge 0; $i--) {
             $j = $script:jobs[$i]
             if (-not $j.H.IsCompleted) { continue }
@@ -64,7 +78,8 @@ $pumpTimer.add_Tick({
                 $e = $_.Exception; while ($e.InnerException) { $e = $e.InnerException }
                 $err = $e.Message
             } finally { $j.PS.Dispose() }
-            try { & $j.Done $res $err } catch { if ($Screenshot) { [IO.File]::AppendAllText("$Screenshot.error.txt", "[$($j.Name)] $($_.Exception.Message) @ $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())`r`n") } }
+            if ($err -and $j.Name -ne 'servers') { Write-AppLog "Error en segundo plano [$($j.Name)]: $err" }
+            try { & $j.Done $res $err } catch { Write-AppLog "Error [$($j.Name)]: $($_.Exception.Message) @ $($_.InvocationInfo.ScriptLineNumber)"; if ($Screenshot) { [IO.File]::AppendAllText("$Screenshot.error.txt", "[$($j.Name)] $($_.Exception.Message) @ $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())`r`n") } }
         }
     })
 $pumpTimer.Start()
@@ -210,12 +225,18 @@ $numPing.Value = [math]::Min(400, [math]::Max(20, [int]$settings.MaxPing)); Set-
 $chkBig = New-Object Windows.Forms.CheckBox
 $chkBig.Text = 'Incluir servers de más de 8'; $chkBig.AutoSize = $true; $chkBig.ForeColor = $C.Text
 $chkBig.Checked = $IncludeBig.IsPresent; $chkBig.Margin = New-Object Windows.Forms.Padding(24, 5, 0, 0)
-$chkValve = New-Object Windows.Forms.CheckBox
-$chkValve.Text = 'Ocultar oficiales de Valve'; $chkValve.AutoSize = $true; $chkValve.ForeColor = $C.Text
-$chkValve.Checked = $HideValve.IsPresent; $chkValve.Margin = New-Object Windows.Forms.Padding(16, 5, 0, 0)
+# Por defecto no se muestran: oficiales sin sala publica (casi siempre "solo amigos") y mutaciones
+$chkFriendsOnly = New-Object Windows.Forms.CheckBox
+$chkFriendsOnly.Text = 'Incluir solo amigos'; $chkFriendsOnly.AutoSize = $true; $chkFriendsOnly.ForeColor = $C.Text
+$chkFriendsOnly.Checked = [bool]$settings.IncludeFriendsOnly; $chkFriendsOnly.Margin = New-Object Windows.Forms.Padding(16, 5, 0, 0)
+(New-Object Windows.Forms.ToolTip).SetToolTip($chkFriendsOnly, "Partidas en servers oficiales sin sala pública: casi siempre son de 'solo amigos' o privadas.`nSi entrás directo, el juego te mete igual en una partida de solo amigos.")
+$chkMutation = New-Object Windows.Forms.CheckBox
+$chkMutation.Text = 'Incluir mutaciones'; $chkMutation.AutoSize = $true; $chkMutation.ForeColor = $C.Text
+$chkMutation.Checked = [bool]$settings.IncludeMutations; $chkMutation.Margin = New-Object Windows.Forms.Padding(16, 5, 0, 0)
+(New-Object Windows.Forms.ToolTip).SetToolTip($chkMutation, 'Servers versus con mutaciones u otro modo (realismo, Taaannnkk!, etc.).')
 $lblPing = New-FieldLabel 'Ping máximo'
 $lblPing.Margin = New-Object Windows.Forms.Padding(24, 6, 6, 0)
-$filters.Controls.AddRange(@((New-FieldLabel 'Somos'), $numParty, $lblPing, $numPing, (New-FieldLabel 'ms'), $chkBig, $chkValve))
+$filters.Controls.AddRange(@((New-FieldLabel 'Somos'), $numParty, $lblPing, $numPing, (New-FieldLabel 'ms'), $chkBig, $chkFriendsOnly, $chkMutation))
 
 # Campaña y tipo de server (filtran la ultima busqueda al instante)
 $modeBar = New-Row 40
@@ -239,21 +260,56 @@ foreach ($k in (@($campaigns.Keys) + 'custom')) {
 # Que el menu no se cierre en cada clic, asi se pueden tildar varias
 $menuCamp.add_Closing({ if ($_.CloseReason -eq 'ItemClicked') { $_.Cancel = $true } })
 
-$cmbType = New-Object Windows.Forms.ComboBox
-$cmbType.DropDownStyle = 'DropDownList'; $cmbType.Width = 220; $cmbType.FlatStyle = 'Flat'
-$cmbType.BackColor = $C.Input; $cmbType.ForeColor = $C.Text; $cmbType.Font = $F.Body
-$cmbType.Width = 250
-# Las opciones dependen de la vista (las carga Set-View)
-$typeOptions = @{
-    servers = @('Todos', 'Solo ZoneMod', 'Solo competitivos', 'Sin competitivo (vanilla)')
-    lobbies = @('Todas', 'Sin host local (oficial o dedicado)', 'Solo oficiales de Valve', 'Solo servers dedicados', 'Solo hosteadas por un jugador')
+# Dos filtros de casillas, iguales en las dos pestañas: Modo (que se juega) y Server (quien hostea).
+# Sin nada tildado = todos. El estado vive en el Tag del boton (los eventos lo leen de $this).
+function New-MultiPick($options, $saved, [int]$width) {
+    $btn = New-FlatButton 'Todos  ▾' $C.Input $C.CardHi $width 26
+    $btn.Font = $F.Body; $btn.TextAlign = 'MiddleLeft'
+    $btn.FlatAppearance.BorderSize = 1; $btn.FlatAppearance.BorderColor = $C.Gray
+    $menu = New-Object Windows.Forms.ContextMenuStrip
+    $menu.ShowCheckMargin = $true; $menu.ShowImageMargin = $false
+    $all = New-Object Windows.Forms.ToolStripMenuItem('Todos')
+    [void]$menu.Items.Add($all)
+    [void]$menu.Items.Add((New-Object Windows.Forms.ToolStripSeparator))
+    $items = [ordered]@{}
+    foreach ($k in $options.Keys) {
+        $it = New-Object Windows.Forms.ToolStripMenuItem($options[$k])
+        $it.CheckOnClick = $true; $it.Tag = $k; $it.Checked = @($saved) -contains $k
+        [void]$menu.Items.Add($it)
+        $items[$k] = $it
+    }
+    $menu.add_Closing({ if ($_.CloseReason -eq 'ItemClicked') { $_.Cancel = $true } })
+    $pick = [pscustomobject]@{ Button = $btn; Menu = $menu; All = $all; Items = $items; Bulk = $false }
+    $btn.Tag = $pick; $menu.Tag = $pick
+    return $pick
 }
-$script:typeSel = @{ servers = [string]$settings.ServerType; lobbies = [string]$settings.LobbyType }
-$script:fillingType = $false
 
-$lblType = New-FieldLabel 'Tipo de server'
-$lblType.Margin = New-Object Windows.Forms.Padding(24, 6, 6, 0)
-$modeBar.Controls.AddRange(@((New-FieldLabel 'Campañas'), $btnCamp, $lblType, $cmbType))
+$modeOptions = [ordered]@{ vanilla = 'Vanilla'; competitivo = 'Competitivo'; zonemod = 'ZoneMod' }
+$hostOptions = [ordered]@{ official = 'Oficiales de Valve'; dedicated = 'Dedicados'; listen = 'Host local' }
+# Config vieja (un solo combo "Tipo de server") -> los dos filtros nuevos
+$savedMode = @($settings.ModeFilter | Where-Object { $_ })
+$savedHost = @($settings.HostFilter | Where-Object { $_ })
+if ($null -eq $settings.ModeFilter -and $null -eq $settings.HostFilter) {
+    switch ([string]$settings.ServerType) {
+        'Solo ZoneMod' { $savedMode = @('zonemod') }
+        'Solo competitivos' { $savedMode = @('competitivo', 'zonemod') }
+        'Sin competitivo (vanilla)' { $savedMode = @('vanilla') }
+        'Solo oficiales de Valve' { $savedHost = @('official') }
+        'Solo de la comunidad (dedicados)' { $savedHost = @('dedicated') }
+        'Solo hosteadas por un jugador' { $savedHost = @('listen') }
+        'Sin host local (oficial o dedicado)' { $savedHost = @('official', 'dedicated') }
+    }
+    if (-not $savedHost.Count -and [string]$settings.LobbyType -like 'Sin host local*') { $savedHost = @('official', 'dedicated') }
+    if ($HideValve) { $savedHost = @('dedicated', 'listen') }
+}
+$pickMode = New-MultiPick $modeOptions $savedMode 210
+$pickHost = New-MultiPick $hostOptions $savedHost 220
+
+$lblMode = New-FieldLabel 'Modo'
+$lblMode.Margin = New-Object Windows.Forms.Padding(24, 6, 6, 0)
+$lblHost = New-FieldLabel 'Server'
+$lblHost.Margin = New-Object Windows.Forms.Padding(24, 6, 6, 0)
+$modeBar.Controls.AddRange(@((New-FieldLabel 'Campañas'), $btnCamp, $lblMode, $pickMode.Button, $lblHost, $pickHost.Button))
 
 # Seguir a un amigo de Steam
 $steamBar = New-Row 46
@@ -266,9 +322,13 @@ $btnFriends = New-FlatButton '↻' $C.CardHi (RGB 66 70 80) 32 26
 $btnFriends.Margin = New-Object Windows.Forms.Padding(4, 0, 0, 0)
 (New-Object Windows.Forms.ToolTip).SetToolTip($btnFriends, 'Actualizar la lista de amigos')
 $chkSteamFollow = New-Object Windows.Forms.CheckBox
-$chkSteamFollow.Text = 'Seguirlo (entro solo a su server o lobby)'; $chkSteamFollow.AutoSize = $true
+$chkSteamFollow.Text = 'Seguirlo'; $chkSteamFollow.AutoSize = $true
 $chkSteamFollow.ForeColor = $C.Text; $chkSteamFollow.Checked = [bool]$settings.SteamFollow
 $chkSteamFollow.Margin = New-Object Windows.Forms.Padding(16, 5, 0, 0)
+(New-Object Windows.Forms.ToolTip).SetToolTip($chkSteamFollow, 'Te lleva solo a su server o lobby cada vez que se mueve. Se pausa y reactiva con la tecla de al lado, también desde el juego.')
+$btnFollowKey = New-FlatButton 'Tecla: F5' $C.CardHi (RGB 66 70 80) 96 26
+$btnFollowKey.Font = $F.Body; $btnFollowKey.Margin = New-Object Windows.Forms.Padding(6, 0, 0, 0)
+(New-Object Windows.Forms.ToolTip).SetToolTip($btnFollowKey, 'Tecla para activar/pausar Seguir, también con el juego abierto. Clic para cambiarla.')
 $chkShare = New-Object Windows.Forms.CheckBox
 $chkShare.Text = 'Compartir mi partida con mis amigos'; $chkShare.AutoSize = $true
 $chkShare.ForeColor = $C.Text; $chkShare.Checked = [bool]$settings.Share
@@ -277,7 +337,7 @@ $chkShare.Visible = (Test-Path $keyFile)
 $btnKey = New-FlatButton 'API key (solo para buscar)' $C.CardHi (RGB 66 70 80) 190 26
 $btnKey.Font = $F.Body; $btnKey.Margin = New-Object Windows.Forms.Padding(16, 0, 0, 0)
 $btnKey.Visible = -not (Test-Path $keyFile)
-$steamBar.Controls.AddRange(@((New-FieldLabel 'Seguir a un amigo de Steam'), $cmbFriend, $btnFriends, $chkSteamFollow, $chkShare, $btnKey))
+$steamBar.Controls.AddRange(@((New-FieldLabel 'Seguir a un amigo de Steam'), $cmbFriend, $btnFriends, $chkSteamFollow, $btnFollowKey, $chkShare, $btnKey))
 
 # Tu grupo: vos + los que te siguen (o, si seguís a alguien, el grupo de esa persona)
 $groupBar = New-Row 48
@@ -390,6 +450,8 @@ function New-Card($r) {
     if ($isLobby -and $r.Server -eq 'listen') { $chips.Controls.Add((New-Chip 'HOST LOCAL' $C.CardHi $C.Amber)) }
     if ($r.Custom -or (-not $isLobby -and $r.Campaign -eq 'custom')) { $chips.Controls.Add((New-Chip 'MAPA CUSTOM' $C.CardHi $C.Amber)) }
     if ($r.Valve -and -not $isLobby) { $chips.Controls.Add((New-Chip 'OFICIAL VALVE' $C.CardHi $C.Dim)) }
+    if ($r.FriendsOnly) { $chips.Controls.Add((New-Chip 'SOLO AMIGOS?' $C.CardHi $C.Orange)) }
+    if ($r.Mutation) { $chips.Controls.Add((New-Chip 'MUTACIÓN' $C.CardHi $C.Amber)) }
     if ($r.Max -gt 8) { $chips.Controls.Add((New-Chip "GRANDE ($($r.Max))" $C.CardHi $C.Amber)) }
 
     $hint = New-Text $r.Hint $F.Small $C.Dim
@@ -448,18 +510,32 @@ function Update-CampButton {
     }
 }
 
-function Test-ServerType($r, [string]$type) {
-    switch ($type) {
-        'Solo ZoneMod' { return [bool]$r.ZoneMod }
-        'Solo competitivos' { return [bool]$r.Competitive }
-        'Sin competitivo (vanilla)' { return -not $r.Competitive }
-        # salas de espera (Options:server del lobby)
-        'Sin host local (oficial o dedicado)' { return $r.Server -in 'official', 'dedicated' }
-        'Solo oficiales de Valve' { return $r.Server -eq 'official' }
-        'Solo servers dedicados' { return $r.Server -eq 'dedicated' }
-        'Solo hosteadas por un jugador' { return $r.Server -eq 'listen' }
-        default { return $true }
-    }
+# Quien hostea: las salas lo dicen (official/dedicated/listen); en la lista de Steam solo hay servers
+# dedicados, y los oficiales se reconocen por el nombre.
+function Get-HostKind($r) {
+    if ($r.Kind -eq 'lobby') { return [string]$r.Server }
+    if ($r.Valve) { return 'official' }
+    return 'dedicated'
+}
+
+# Que se juega: ZoneMod (por el nombre), competitivo (tag confogl) o vanilla. Las salas de espera son siempre vanilla.
+function Get-ModeKind($r) {
+    if ($r.ZoneMod) { return 'zonemod' }
+    if ($r.Competitive) { return 'competitivo' }
+    return 'vanilla'
+}
+
+function Get-Picked($pick) { return @($pick.Items.Values | Where-Object { $_.Checked } | ForEach-Object { $_.Tag }) }
+
+function Update-PickButton($pick) {
+    $sel = @(Get-Picked $pick)
+    $pick.All.Checked = ($sel.Count -eq 0)
+    $pick.Button.Text = if ($sel.Count -eq 0 -or $sel.Count -eq $pick.Items.Count) { 'Todos  ▾' }
+    else { (($sel | ForEach-Object { $pick.Items[$_].Text }) -join ' + ') + '  ▾' }
+}
+
+function Test-ServerType($r, $modes, $hosts) {
+    return ($modes.Count -eq 0 -or $modes -contains (Get-ModeKind $r)) -and ($hosts.Count -eq 0 -or $hosts -contains (Get-HostKind $r))
 }
 
 # Baja en segundo plano las portadas de la Workshop que faltan y redibuja al terminar
@@ -492,8 +568,11 @@ function Show-Rows {
     if ($null -eq $all) { return }
     $lobbies = $script:view -eq 'lobbies'
     $sel = @(Get-SelectedCampaigns)
-    $type = [string]$cmbType.SelectedItem
-    $rows = @($all | Where-Object { ($sel.Count -eq 0 -or $sel -contains $_.Campaign) -and (Test-ServerType $_ $type) })
+    $modes = @(Get-Picked $pickMode); $hosts = @(Get-Picked $pickHost)
+    $showFriendsOnly = $chkFriendsOnly.Checked; $showMutation = $chkMutation.Checked
+    $rows = @($all | Where-Object {
+            ($sel.Count -eq 0 -or $sel -contains $_.Campaign) -and (Test-ServerType $_ $modes $hosts) -and
+            ($showFriendsOnly -or -not $_.FriendsOnly) -and ($showMutation -or -not $_.Mutation) })
     Clear-List
     $list.SuspendLayout()
     foreach ($r in $rows) { $list.Controls.Add((New-Card $r)) }
@@ -503,14 +582,21 @@ function Show-Rows {
         Show-Message $(if ($lobbies) { 'No hay salas de espera de versus con lugar para ustedes ahora. Probá de nuevo en un rato.' }
             else { 'No hay servers con lugar. Probá subir el ping máximo o buscar de nuevo en un rato.' })
     } elseif ($rows.Count -eq 0) {
-        $wantsRare = ($sel -contains 'custom') -or ($type -in 'Solo ZoneMod', 'Solo competitivos')
-        if (-not $lobbies -and $wantsRare -and $numPing.Value -lt 200) {
+        $onlyComp = $modes.Count -and $modes -notcontains 'vanilla'
+        $wantsRare = ($sel -contains 'custom') -or $onlyComp
+        if ($lobbies -and $onlyComp) {
+            Show-Message 'Las salas de espera son partidas comunes del juego: no hay ZoneMod ni competitivos. Para eso mirá "Partidas en curso".'
+        } elseif (-not $lobbies -and $hosts.Count -eq 1 -and $hosts[0] -eq 'listen') {
+            Show-Message 'Las partidas en curso de la lista de Steam son todas de servers dedicados. Las que hostea un jugador aparecen en "Salas de espera".'
+        } elseif (-not $lobbies -and $wantsRare -and $numPing.Value -lt 200) {
             Show-Message 'Nada con estos filtros. Casi todos los servers ZoneMod y de mapas custom están en EE.UU. (150-190 ms): subí el ping máximo a 200 y tocá Buscar.'
-        } else { Show-Message 'Nada coincide con estos filtros ahora. Probá con otra campaña o tipo de server.' }
+        } else { Show-Message 'Nada coincide con estos filtros ahora. Probá con otra campaña, modo o tipo de server.' }
     }
     $seguros = @($rows | Where-Object { $_.Rank -eq 0 }).Count
     $what = if ($lobbies) { 'salas de espera' } else { 'servers' }
-    $status.Text = "Mostrando $($rows.Count) de $($all.Count) $what ($seguros seguros).  Última búsqueda: $($script:times[$script:view])"
+    $hidden = @($all | Where-Object { ($_.FriendsOnly -and -not $showFriendsOnly) -or ($_.Mutation -and -not $showMutation) }).Count
+    $hiddenTxt = if ($hidden) { "  $hidden ocultos (solo amigos / mutaciones)." } else { '' }
+    $status.Text = "Mostrando $($rows.Count) de $($all.Count) $what ($seguros seguros).$hiddenTxt  Última búsqueda: $($script:times[$script:view])"
 }
 
 function Set-View([string]$v) {
@@ -524,15 +610,9 @@ function Set-View([string]$v) {
     }
     # El ping y los servers grandes no aplican a las salas de espera
     $numPing.Enabled = $v -eq 'servers'; $chkBig.Enabled = $v -eq 'servers'
+    $chkFriendsOnly.Enabled = $v -eq 'servers'; $chkMutation.Enabled = $v -eq 'servers'   # las salas listadas son siempre publicas y versus
     $subtitle.Text = if ($v -eq 'lobbies') { 'Left 4 Dead 2  ·  salas de espera con lugar para tu grupo' } else { 'Left 4 Dead 2  ·  servers con lugar para tu grupo' }
-    # Cada vista tiene sus propias opciones de "Tipo de server" y recuerda la elegida
-    $script:fillingType = $true
-    $cmbType.BeginUpdate()
-    $cmbType.Items.Clear()
-    [void]$cmbType.Items.AddRange([object[]]$typeOptions[$v])
-    $cmbType.SelectedItem = if ($typeOptions[$v] -contains $script:typeSel[$v]) { $script:typeSel[$v] } else { $typeOptions[$v][0] }
-    $cmbType.EndUpdate()
-    $script:fillingType = $false
+
     Clear-List
     if ($null -ne $script:results[$v]) { Show-Rows }
     elseif ($btnSearch.Enabled -and ($v -eq 'lobbies' -or (Test-Path $keyFile))) { $btnSearch.PerformClick() }
@@ -547,7 +627,7 @@ $partyTimer.add_Tick({
         $p = [int]$numParty.Value
         # Salas: si ya las pedimos para un grupo igual o más chico, alcanza con volver a filtrar
         if ($script:lobbyJson -and $p -ge $script:lobbyJsonParty) {
-            $script:results.lobbies = @(ConvertTo-LobbyRows $script:lobbyJson $p ([bool]$chkValve.Checked))
+            $script:results.lobbies = @(ConvertTo-LobbyRows $script:lobbyJson $p $false)
         } else { $script:results.lobbies = $null }
         $script:results.servers = $null   # el veredicto de los servers depende del tamaño: rehacer
         if ($null -ne $script:results[$script:view]) { Show-Rows }
@@ -567,11 +647,22 @@ $itemAll.add_Click({
 foreach ($it in $campItems.Values) {
     $it.add_CheckedChanged({ if (-not $script:bulkCheck) { Update-CampButton; Show-Rows } })
 }
-$cmbType.add_SelectedIndexChanged({
-        if ($script:fillingType) { return }
-        $script:typeSel[$script:view] = [string]$cmbType.SelectedItem
-        Show-Rows
-    })
+$chkFriendsOnly.add_CheckedChanged({ Show-Rows })
+$chkMutation.add_CheckedChanged({ Show-Rows })
+foreach ($pick in $pickMode, $pickHost) {
+    $pick.Button.add_Click({ $this.Tag.Menu.Show($this, 0, $this.Height) })
+    $pick.All.add_Click({
+            $p = $this.Owner.Tag
+            $p.Bulk = $true
+            foreach ($it in $p.Items.Values) { $it.Checked = $false }
+            $p.Bulk = $false
+            Update-PickButton $p; Show-Rows
+        })
+    foreach ($it in $pick.Items.Values) {
+        $it.add_CheckedChanged({ $p = $this.Owner.Tag; if (-not $p.Bulk) { Update-PickButton $p; Show-Rows } })
+    }
+    Update-PickButton $pick
+}
 Update-CampButton
 
 $list.add_Resize({
@@ -583,6 +674,7 @@ $list.add_Resize({
 
 # ---------------- acciones ----------------
 function Invoke-Join([string]$link) {
+    Write-AppLog "Unirme (botón): $link"
     Start-Process $link
     if ($link -like 'steam://joinlobby/*') {
         $status.Text = 'Entrando a la sala...  Si "Compartir mi partida" está tildado, tus amigos que te siguen entran solos.'
@@ -610,7 +702,7 @@ $btnSearch.add_Click({
         if ($script:view -eq 'lobbies') {
             # Las salas se piden a Steam en un proceso aparte (en segundo plano: la ventana no se traba)
             $status.Text = 'Pidiéndole a Steam las salas de espera de versus...'
-            $script:lobbyArgs = @{ Party = [int]$numParty.Value; HideValve = [bool]$chkValve.Checked }   # el $done corre en otro alcance
+            $script:lobbyArgs = @{ Party = [int]$numParty.Value; HideValve = $false }   # el $done corre en otro alcance
             Start-Async 'lobbies' { param($p, $dir) Get-LobbyJson $p $dir } @($script:lobbyArgs.Party, $here) {
                 param($res, $err)
                 Stop-Searching
@@ -630,16 +722,27 @@ $btnSearch.add_Click({
             Show-Message 'Para buscar partidas en curso hace falta la API key de Steam (botón "API key"). Las salas de espera no la necesitan.'
             return
         }
-        try {
-            $rows = Find-Servers ([int]$numParty.Value) ([int]$numPing.Value) $chkBig.Checked $chkValve.Checked {
-                param($m) $status.Text = $m; [Windows.Forms.Application]::DoEvents()
-            }
-            $script:results.servers = @($rows)
+        # La busqueda corre en otro hilo: la ventana sigue respondiendo y abajo se ve el avance
+        $script:searchState = [hashtable]::Synchronized(@{ Msg = 'Pidiendo la lista de servidores a Steam...' })
+        $status.Text = $script:searchState.Msg
+        Start-Async 'servers' {
+            param($finder, $p, $ping, $big, $valve, $state)
+            $ErrorActionPreference = 'Stop'
+            $here = Split-Path -Parent $finder
+            $keyFile = Join-Path $here 'apikey.txt'
+            # Cargar solo la parte de busqueda de finder.ps1 (sin abrir otra ventana)
+            $src = [IO.File]::ReadAllText($finder)
+            $a = $src.IndexOf('# >>> BUSQUEDA'); $b = $src.IndexOf('# <<< BUSQUEDA')
+            . ([scriptblock]::Create($src.Substring($a, $b - $a)))
+            Find-Servers $p $ping $big $valve { param($m) $state.Msg = $m }
+        } @((Join-Path $here 'finder.ps1'), [int]$numParty.Value, [int]$numPing.Value, [bool]$chkBig.Checked, $false, $script:searchState) {
+            param($res, $err)
+            Stop-Searching
+            if ($err) { $status.Text = "Error: $err"; return }
+            $script:results.servers = @($res | ForEach-Object { $_ })
             $script:times.servers = Get-Date -Format 'HH:mm'
             if ($script:view -eq 'servers') { Show-Rows }
-        } catch {
-            $status.Text = "Error: $($_.Exception.Message)"
-        } finally { Stop-Searching }
+        }
     })
 
 # ---------------- seguir a un amigo de Steam ----------------
@@ -649,6 +752,8 @@ $script:friendIds = @()
 $script:friendNames = @()
 $script:followLobby = ''
 $script:joinedServer = ''   # ultimo server al que te llevó (no se borra al destildar)
+$script:pendingAction = ''; $script:pendingSince = Get-Date; $script:leaderState = ''; $script:leaderLobby = ''; $script:followedFor = ''; $script:myName = ''
+$script:followKeyName = 'La casilla'
 $script:lobbyJoinedAt = [datetime]::MinValue
 $script:shareState = ''
 $script:shareSentAt = [datetime]::MinValue
@@ -851,6 +956,8 @@ function Update-FriendList([switch]$Quiet) {
         $byHash = @{}
         foreach ($fr in @($r.All)) { $byHash[$fr.Hash] = $fr }   # ojo: $f pisaria $F (fuentes)
         $script:friendByHash = $byHash
+        $mine = @($r.All | Where-Object { $_.SteamId -eq $script:me })
+        if ($mine.Count) { $script:myName = [string]$mine[0].Name }   # para reconocerte en la lista de jugadores de un server
         $script:groupKey = ''; Update-Group $script:lastGroupHashes   # ahora con nombres
         if ($cmbFriend.DroppedDown) { return }
         $cmbFriend.BeginUpdate()
@@ -904,41 +1011,78 @@ $steamTimer.add_Tick({
             }
             if (-not $b.Playing) { $status.Text = "$name no está jugando L4D2 ahora."; return }
 
-            # Regla: solo mandar una orden cuando el amigo se mueve a un server DISTINTO, o arma un lobby
-            # nuevo estando fuera de un server. Cualquier orden extra (reconectar al mismo server, unirse
-            # a un lobby) saca al juego de la partida en la que ya estás.
-            if ($b.Server) {
-                # Una vez que estamos en su server, se deja de seguir: si despues el amigo se va,
-                # vos te quedas en la partida. Para volver a seguirlo, se tilda "Seguirlo" de nuevo.
-                $stopMsg = "Dejé de seguir a $name para que no te saque de la partida si se va. Seguís en su grupo; tildá 'Seguirlo' para que te vuelva a llevar."
-                # Si ya te llevé a este mismo server, no reconectar (te sacaría de la partida): esperar a que cambie
-                if ($b.Server -eq $script:joinedServer) {
-                    $status.Text = "Ya te llevé al server de $name ($($b.Server)). Te llevo de nuevo cuando se cambie de server."
-                    return
-                }
-                $script:joinedServer = $b.Server
-                # Si hace poco entramos a su lobby, el juego nos lleva junto con el lobby: no conectar a mano
-                if ($script:followLobby -and ($b.Lobby -eq $script:followLobby -or (Get-Date) -lt $script:lobbyJoinedAt.AddSeconds(120))) {
-                    $script:autoUncheck = $true; $chkSteamFollow.Checked = $false; $script:autoUncheck = $false   # sigue en el grupo
-                    $status.Text = "Entrás con el lobby de $name al server $($b.Server). $stopMsg"
-                    return
-                }
-                [System.Media.SystemSounds]::Asterisk.Play()
-                Start-Process "steam://connect/$($b.Server)"
-                $script:autoUncheck = $true; $chkSteamFollow.Checked = $false; $script:autoUncheck = $false   # sigue en el grupo
-                $status.Text = "$name está en el server $($b.Server): te llevo. $stopMsg"
-                return
-            }
+            $state = "$($b.Server)|$($b.Lobby)"
+            if ($state -ne $script:leaderState) { Write-AppLog "Líder ${name}: server='$($b.Server)' lobby='$($b.Lobby)'" }
+            $prevLobby = $script:leaderLobby   # lobby del lider en el chequeo anterior
+            $script:leaderState = $state; $script:leaderLobby = [string]$b.Lobby
 
-            # Sin server: si armó un lobby nuevo, entrar a su lobby (y seguir esperando a que arranque)
-            if ($b.Lobby -and $b.Lobby -ne $script:followLobby) {
-                $script:followLobby = $b.Lobby; $script:lobbyJoinedAt = Get-Date
-                [System.Media.SystemSounds]::Asterisk.Play()
-                Start-Process "steam://joinlobby/550/$($b.Lobby)/$fid"
-                $status.Text = "$name armó un lobby. Te llevo..."
+            # Reglas (cualquier orden de mas saca al juego de la partida en la que estás):
+            # - Solo se manda una orden por destino nuevo (server o lobby distinto al último al que te llevé).
+            # - Si entraste a su lobby, al arrancar la partida el juego te lleva con el lobby: no conectar a mano.
+            # - Lo nuevo se confirma si dura al menos 10 s, para no reaccionar a estados de paso (cargas, cambios de mapa).
+            # - Antes de conectar a un server, se mira si ya estás adentro (tu nombre en su lista de jugadores).
+            $action = ''
+            if ($b.Server) {
+                if ($b.Server -eq $script:joinedServer) {
+                    $status.Text = "Estás en el server de $name ($($b.Server)). Si se cambia de server o arma otro lobby, te llevo."
+                } elseif ($script:followLobby -and ($b.Lobby -eq $script:followLobby -or (-not $b.Lobby -and $prevLobby -eq $script:followLobby))) {
+                    $script:joinedServer = $b.Server
+                    Write-AppLog "Su lobby arrancó en $($b.Server): entrás con el lobby, no mando nada."
+                    $status.Text = "La partida del lobby de $name arrancó en $($b.Server): entrás con el lobby."
+                } else { $action = "connect|$($b.Server)" }
+            } elseif ($b.Lobby) {
+                if ($b.Lobby -eq $script:followLobby) { $status.Text = "Estás en el lobby de $name." }
+                else { $action = "lobby|$($b.Lobby)" }
+            } else {
+                $script:followLobby = ''   # volvió al menú sin lobby: lo próximo es nuevo
+                $status.Text = "$name está en el menú del juego. Cuando entre a un server o arme un lobby, te llevo."
+            }
+            if (-not $action) { $script:pendingAction = ''; return }
+            if ($script:pendingAction -ne $action) {
+                $script:pendingAction = $action; $script:pendingSince = Get-Date
+                Write-AppLog "Nuevo destino, lo confirmo en unos segundos: $action"
                 return
             }
-            $status.Text = if ($b.Lobby) { "Siguiendo a $name (su lobby)." } else { "$name está en el menú del juego. Cuando entre a un server o arme un lobby, te llevo." }
+            if (((Get-Date) - $script:pendingSince).TotalSeconds -lt 10) { return }   # que dure al menos 10 s (no es una pantalla de carga)
+            $script:pendingAction = ''
+            $kind, $target = $action -split '\|', 2
+            if ($kind -eq 'lobby') {
+                $script:followLobby = $target; $script:joinedServer = ''
+                Write-AppLog "ORDEN: steam://joinlobby/550/$target/$fid"
+                [System.Media.SystemSounds]::Asterisk.Play()
+                Start-Process "steam://joinlobby/550/$target/$fid"
+                $status.Text = "$name armó un lobby. Te llevo... (para dejar de seguirlo: $($script:followKeyName))"
+                return
+            }
+            # Conectar: primero ver si ya estás en ese server (p. ej. abriste la app o reactivaste Seguir estando adentro)
+            $script:checkTarget = $target; $script:checkLobby = [string]$b.Lobby
+            Start-Async 'followcheck' {
+                param($finder, $addr)
+                $src = [IO.File]::ReadAllText($finder)
+                $a = $src.IndexOf('# >>> BUSQUEDA'); $b = $src.IndexOf('# <<< BUSQUEDA')
+                . ([scriptblock]::Create($src.Substring($a, $b - $a)))
+                $pl = Invoke-PlayerScan @($addr) 2000
+                $list = if ($pl.ContainsKey($addr)) { @($pl[$addr]) } else { @() }
+                [pscustomobject]@{ Names = @($list | ForEach-Object { [string]$_.Name }); Answered = $pl.ContainsKey($addr) }
+            } @((Join-Path $here 'finder.ps1'), $target) {
+                param($res2, $err2)
+                if (-not $chkSteamFollow.Checked) { return }
+                $target = $script:checkTarget
+                $who = $script:friendNames[$cmbFriend.SelectedIndex]
+                $chk = Get-First $res2
+                $script:joinedServer = $target
+                if ($chk -and $script:myName -and @($chk.Names) -contains $script:myName) {
+                    if ($script:checkLobby) { $script:followLobby = $script:checkLobby }
+                    Write-AppLog "Ya estás en $target (te vi en la lista de jugadores): no reconecto."
+                    $status.Text = "Ya estás en el server de $who. Si se cambia de server o arma otro lobby, te llevo."
+                    return
+                }
+                if ($script:checkLobby) { $script:followLobby = $script:checkLobby }   # entrar a su server te mete en su lobby
+                Write-AppLog "ORDEN: steam://connect/$target  (nombres en el server: $(if ($chk) { @($chk.Names).Count } else { '?' }); yo='$($script:myName)')"
+                [System.Media.SystemSounds]::Asterisk.Play()
+                Start-Process "steam://connect/$target"
+                $status.Text = "$who está en el server $($target): te llevo. (para dejar de seguirlo: $($script:followKeyName))"
+            }
         }
     })
 $steamTimer.Start()
@@ -967,23 +1111,96 @@ $shareTimer.add_Tick({
                 $where = if ($r.Mine.Server) { "en el server $($r.Mine.Server)" } elseif ($r.Mine.Lobby) { 'en un lobby' } else { 'en el menú' }
                 $status.Text = "Compartiendo tu partida con tus amigos: estás $where."
             }
+            if ($r.State -ne $script:shareState) { Write-AppLog "Compartiendo mi estado: $($r.State)  (en L4D2|server|lobby)" }
             $script:shareState = $r.State; $script:shareSentAt = Get-Date
         }
     })
 $shareTimer.Start()
 
 $chkSteamFollow.add_CheckedChanged({
-        $script:followLobby = ''
-        # Grupo: tildar = entrar al grupo del amigo; destildar a mano = salir (el destildado automatico no saca)
+        $script:pendingAction = ''
+        Write-AppLog "Seguir $(if ($chkSteamFollow.Checked) { 'ACTIVADO' } else { 'desactivado' }) ($(if ($script:autoUncheck) { 'tecla' } else { 'casilla' })) - amigo $(Get-FollowedId)"
+        # Grupo: tildar = entrar al grupo del amigo; destildar con la casilla = salir (con la tecla solo se pausa)
         if ($chkSteamFollow.Checked) { $fid = Get-FollowedId; if ($fid -and $fid -ne $script:groupLeader) { Set-GroupLeader $fid } }
         elseif (-not $script:autoUncheck -and $script:groupLeader) { Set-GroupLeader '' }
         if ($chkSteamFollow.Checked) {
             if (-not (Get-FollowedId)) { $status.Text = 'Elegí a quién seguir en la lista de amigos.' }
-            else { $status.Text = "Siguiendo a $($script:friendNames[$cmbFriend.SelectedIndex]). Dejá esta ventana abierta (puede estar minimizada)." }
-        }
+            else { $status.Text = "Siguiendo a $($script:friendNames[$cmbFriend.SelectedIndex]). Dejá esta ventana abierta (puede estar minimizada). $($script:followKeyName) lo pausa." }
+        } else { $status.Text = "Dejaste de seguir. $($script:followKeyName) (o la casilla) lo vuelve a activar." }
     })
 $chkShare.add_CheckedChanged({ $script:shareState = '' })
-$cmbFriend.add_SelectedIndexChanged({ $script:followLobby = '' })
+# Al cambiar de amigo se olvida su lobby/server (pero no cuando la lista se refresca sola con el mismo amigo)
+$cmbFriend.add_SelectedIndexChanged({
+        $fid = Get-FollowedId
+        if ($fid -and $fid -ne $script:followedFor) {
+            $script:followedFor = $fid; $script:followLobby = ''; $script:joinedServer = ''; $script:pendingAction = ''; $script:leaderState = ''; $script:leaderLobby = ''
+        }
+    })
+
+# --- tecla para activar/pausar "Seguirlo" desde el juego (global; por defecto F5) ---
+if (-not ('FollowHotKey' -as [type])) {
+    Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @"
+using System;
+using System.Windows.Forms;
+using System.Runtime.InteropServices;
+public class FollowHotKey : NativeWindow {
+    [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr h, int id, uint mods, uint vk);
+    [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr h, int id);
+    public event EventHandler Pressed;
+    bool on;
+    public FollowHotKey() { var cp = new CreateParams(); cp.Parent = new IntPtr(-3); CreateHandle(cp); }
+    public bool Set(int vk) {
+        if (on) { UnregisterHotKey(Handle, 1); on = false; }
+        if (vk == 0) return true;
+        on = RegisterHotKey(Handle, 1, 0x4000, (uint)vk);
+        return on;
+    }
+    protected override void WndProc(ref Message m) {
+        if (m.Msg == 0x0312 && Pressed != null) Pressed(this, EventArgs.Empty);
+        base.WndProc(ref m);
+    }
+}
+"@
+}
+# Ventana invisible (solo mensajes) que recibe la tecla aunque el juego tenga el foco. 0x4000 = sin repeticion.
+$hotKey = New-Object FollowHotKey
+function Set-FollowKey([string]$keyName) {
+    $vk = 0
+    if ($keyName) { try { $vk = [int][Windows.Forms.Keys]$keyName } catch { $keyName = '' } }
+    $ok = $hotKey.Set($vk)
+    $script:followKeyName = if ($keyName) { $keyName } else { 'La casilla' }
+    $btnFollowKey.Text = if ($keyName) { "Tecla: $keyName" } else { 'Tecla: ninguna' }
+    if (-not $ok) { $status.Text = "No pude usar $keyName como tecla de Seguir (la usa otro programa). Elegí otra."; $btnFollowKey.Text = "Tecla: $keyName (ocupada)" }
+    return $ok
+}
+$hotKey.add_Pressed({
+        if (-not (Get-FollowedId)) { [Console]::Beep(300, 150); return }
+        $script:autoUncheck = $true; $chkSteamFollow.Checked = -not $chkSteamFollow.Checked; $script:autoUncheck = $false
+        # Aviso con sonido (estás en el juego y no ves la ventana): agudo = siguiendo, grave = pausado
+        if ($chkSteamFollow.Checked) { [Console]::Beep(660, 90); [Console]::Beep(990, 120) } else { [Console]::Beep(500, 90); [Console]::Beep(330, 160) }
+    })
+$script:capturingKey = $false
+$btnFollowKey.add_Click({
+        $script:capturingKey = $true
+        $btnFollowKey.Text = 'Apretá una tecla...'
+        $status.Text = 'Apretá la tecla para activar/pausar Seguir (Esc cancela, Supr = ninguna).'
+    })
+$form.KeyPreview = $true
+$form.add_KeyDown({
+        if (-not $script:capturingKey) { return }
+        $_.Handled = $true; $_.SuppressKeyPress = $true
+        $k = [string]$_.KeyCode
+        if ($k -in 'ShiftKey', 'ControlKey', 'Menu', 'LWin', 'RWin') { return }   # esperar una tecla de verdad
+        $script:capturingKey = $false
+        if ($k -eq 'Escape') { [void](Set-FollowKey ([string]$settings.FollowKey)); $status.Text = 'Sin cambios.'; return }
+        $name = if ($k -in 'Delete', 'Back') { '' } else { $k }
+        if (Set-FollowKey $name) {
+            $settings.FollowKey = $name
+            Write-AppLog "Tecla de Seguir: '$name'"
+            $status.Text = if ($name) { "Listo: $name activa/pausa Seguir, también desde el juego." } else { 'Seguir queda solo con la casilla.' }
+        }
+    })
+[void](Set-FollowKey ([string]$settings.FollowKey))
 # Solo cuando lo elegís vos (no cuando la lista se refresca sola)
 $cmbFriend.add_SelectionChangeCommitted({
         $fid = Get-FollowedId
@@ -1077,6 +1294,8 @@ $form.add_Shown({
         }
     })
 $form.add_FormClosing({
+        try { [void]$hotKey.Set(0) } catch {}
+        Write-AppLog '=== App cerrada'
         $autoTimer.Stop(); $steamTimer.Stop(); $friendsTimer.Stop(); $shareTimer.Stop(); $pumpTimer.Stop(); $groupTimer.Stop(); $beatTimer.Stop()
         # Avisar que dejás el grupo (si no llega, el lider te saca solo al minuto y poco)
         if ($script:groupLeader -and $script:me -and -not $Screenshot) { try { Send-FollowSignal $script:me '' } catch {} }
@@ -1086,8 +1305,10 @@ $form.add_FormClosing({
         $settings.SteamFollow = $chkSteamFollow.Checked
         $settings.AutoRefresh = $chkAuto.Checked
         $settings.Campaigns = @(Get-SelectedCampaigns)
-        $settings.ServerType = [string]$script:typeSel.servers
-        $settings.LobbyType = [string]$script:typeSel.lobbies
+        $settings.IncludeFriendsOnly = $chkFriendsOnly.Checked
+        $settings.IncludeMutations = $chkMutation.Checked
+        $settings.ModeFilter = @(Get-Picked $pickMode)
+        $settings.HostFilter = @(Get-Picked $pickHost)
         $settings.View = $script:view
         $settings.Party = [int]$numParty.Value
         $settings.MaxPing = [int]$numPing.Value
