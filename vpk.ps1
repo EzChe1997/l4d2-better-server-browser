@@ -1,4 +1,4 @@
-# vpk.ps1 - lector minimo de archivos VPK de Source (v1/v2) + conversion de las imagenes
+﻿# vpk.ps1 - lector minimo de archivos VPK de Source (v1/v2) + conversion de las imagenes
 # de mapas del lobby (VTF DXT1/DXT5) a PNG. Se usa con dot-sourcing: . .\vpk.ps1
 
 Add-Type -AssemblyName System.Drawing
@@ -21,6 +21,17 @@ public static class L4dVtf {
         return (r << 16) | (g << 8) | bl;
     }
 
+    // Fuentes del juego (.vfont): un TTF cifrado con XOR encadenado; al final van la sal, su largo y "VFONT1".
+    public static byte[] DecodeVFont(byte[] d) {
+        int n = d.Length;
+        if (n < 8 || System.Text.Encoding.ASCII.GetString(d, n - 6, 6) != "VFONT1") return null;
+        int len = n - 6 - d[n - 7];
+        if (len <= 0) return null;
+        byte[] o = new byte[len];
+        int k = d[0];   // un TTF arranca con 0x00
+        for (int i = 0; i < len; i++) { int c = d[i]; o[i] = (byte)(c ^ k); k = (c + 0xA7) & 255; }
+        return o;
+    }
     // Decodifica el mip mas grande (que en los VTF esta al final del archivo).
     public static Bitmap Decode(byte[] d) {
         int w = BitConverter.ToUInt16(d, 16), h = BitConverter.ToUInt16(d, 18);
@@ -101,6 +112,81 @@ function Export-MapImages([string]$gameDir, [string]$outDir) {
     return $n
 }
 
+# Fuentes del juego (Trade Gothic y Stubble) a TTF en $outDir. Son rapidas: no tocan los VPK.
+function Export-GameFonts([string]$gameDir, [string]$outDir) {
+    New-Item -ItemType Directory -Force $outDir | Out-Null
+    $n = 0
+    foreach ($name in 'tgb', 'tg', 'stubble-bold') {
+        $src = Join-Path $gameDir "left4dead2\resource\$name.vfont"
+        if (-not (Test-Path $src)) { continue }
+        $ttf = [L4dVtf]::DecodeVFont([IO.File]::ReadAllBytes($src))
+        if ($ttf) { [IO.File]::WriteAllBytes((Join-Path $outDir "$name.ttf"), $ttf); $n++ }
+    }
+    return $n
+}
+
+# Arte de la interfaz sacado del juego: el spinner de carga, el logo, el fondo del menu y el borde rasgado.
+function Export-UiArt([string]$gameDir, [string]$outDir) {
+    $dirFile = Join-Path $gameDir 'left4dead2\pak01_dir.vpk'
+    if (-not (Test-Path $dirFile)) { return 0 }
+    $want = @{
+        'materials/vgui/left4dead2logo.vtf'                = 'ui_logo'
+        'materials/console/background_menu_widescreen.vtf' = 'ui_bg'
+        'materials/vgui/menu_backgroud_bottom.vtf'         = 'ui_edge'
+    }
+    $n = 0; $spin = $null
+    foreach ($e in (Read-VpkIndex $dirFile)) {
+        if ($e.Path -eq 'materials/engine/l4d_spinner.vtf') { $spin = $e; continue }
+        if (-not $want.ContainsKey($e.Path)) { continue }
+        try {
+            $bmp = [L4dVtf]::Decode((Read-VpkFile $e))
+            if ($want[$e.Path] -eq 'ui_logo') {
+                # Recortar al dibujo (el VTF tiene mucho borde transparente)
+                $x0 = $bmp.Width; $y0 = $bmp.Height; $x1 = 0; $y1 = 0
+                for ($y = 0; $y -lt $bmp.Height; $y += 2) { for ($x = 0; $x -lt $bmp.Width; $x += 2) {
+                        if ($bmp.GetPixel($x, $y).A -gt 40) { if ($x -lt $x0) { $x0 = $x }; if ($x -gt $x1) { $x1 = $x }; if ($y -lt $y0) { $y0 = $y }; if ($y -gt $y1) { $y1 = $y } } } }
+                if ($x1 -gt $x0) {
+                    $crop = $bmp.Clone((New-Object Drawing.Rectangle($x0, $y0, ($x1 - $x0 + 2), ($y1 - $y0 + 2))), $bmp.PixelFormat)
+                    $bmp.Dispose(); $bmp = $crop
+                }
+            } elseif ($want[$e.Path] -eq 'ui_bg') {
+                # Esta guardado cuadrado pero es 16:9
+                $wide = New-Object Drawing.Bitmap(1024, 576)
+                $g = [Drawing.Graphics]::FromImage($wide); $g.InterpolationMode = 'HighQualityBicubic'
+                $g.DrawImage($bmp, 0, 0, 1024, 576); $g.Dispose(); $bmp.Dispose(); $bmp = $wide
+            }
+            $bmp.Save((Join-Path $outDir "$($want[$e.Path]).png"), [Drawing.Imaging.ImageFormat]::Png)
+            $bmp.Dispose(); $n++
+        } catch {}
+    }
+    if ($spin) { $n += Export-Spinner $gameDir $outDir $spin }
+    return $n
+}
+# Exporta el spinner de carga de L4D2 (materials/engine/l4d_spinner.vtf: 10 cuadros de 64x64) a
+# spinner_0.png ... spinner_9.png en $outDir. Devuelve cuantos cuadros exporto.
+function Export-Spinner([string]$gameDir, [string]$outDir, $entry) {
+    if ($entry) { $e = @($entry) } else {
+        $dirFile = Join-Path $gameDir 'left4dead2\pak01_dir.vpk'
+        if (-not (Test-Path $dirFile)) { return 0 }
+        $e = @(Read-VpkIndex $dirFile | Where-Object { $_.Path -eq 'materials/engine/l4d_spinner.vtf' })
+    }
+    if (-not $e.Count) { return 0 }
+    $d = Read-VpkFile $e[0]
+    $w = [BitConverter]::ToUInt16($d, 16); $h = [BitConverter]::ToUInt16($d, 18); $frames = [int][BitConverter]::ToUInt16($d, 24)
+    $frameSize = [math]::Max(1, [math]::Floor(($w + 3) / 4)) * [math]::Max(1, [math]::Floor(($h + 3) / 4)) * 16   # DXT5
+    if ([BitConverter]::ToInt32($d, 52) -ne 15 -or $frames -lt 1) { return 0 }
+    # El mip mas grande de todos los cuadros va al final del archivo, un cuadro detras de otro
+    $start = $d.Length - $frames * $frameSize
+    for ($k = 0; $k -lt $frames; $k++) {
+        $end = $start + ($k + 1) * $frameSize
+        $part = New-Object byte[] $end
+        [Array]::Copy($d, $part, $end)
+        $bmp = [L4dVtf]::Decode($part)
+        $bmp.Save((Join-Path $outDir "spinner_$k.png"), [Drawing.Imaging.ImageFormat]::Png)
+        $bmp.Dispose()
+    }
+    return $frames
+}
 function Read-VpkIndex([string]$dirFile) {
     $fs = [IO.File]::OpenRead($dirFile)
     $br = New-Object IO.BinaryReader($fs)

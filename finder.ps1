@@ -5,7 +5,7 @@
   Modo consola (pruebas):
     powershell -ExecutionPolicy Bypass -File finder.ps1 -Console -Party 2 -MaxPing 150
 
-  Necesita apikey.txt (key de Steam) en esta misma carpeta.
+  No necesita API key: la lista de servers se le pide al cliente de Steam (tiene que estar abierto).
 #>
 param(
     [switch]$Console,
@@ -28,7 +28,7 @@ $keyFile = Join-Path $here 'apikey.txt'
 # ======================= actualizaciones automaticas =======================
 # La app se fija si hay una version nueva publicada en GitHub. El indice (update.json) va firmado
 # con una clave que solo tiene quien publica: si la firma no coincide, la actualizacion se ignora.
-$AppVersion = 4
+$AppVersion = 5
 $updateBase = 'https://raw.githubusercontent.com/EzChe1997/l4d2-better-server-browser/main'   # lo completa publicar.ps1 (https://raw.githubusercontent.com/<usuario>/<repo>/main)
 $updatePublicKey = '<RSAKeyValue><Modulus>3uVFz1ZH9ed0Zun/YcmPi4gk8EALr+R7/DYQY+Fz5NArgRYEo1iNfjNpBUn7G3R0Tliw5DjecmnM0/InLrFLJl2BgMmwJo0VBw4BJ/7qmQm1q7oJoZ0mjI8cgxynbgyhARnQY3i9lVnEGfwB3IOnYhire7XM6iFxui9b5fOd3npzorhJakLqdMdPLBc7BT5VE8E/MfeyhlhusGlKpgsB4QWY3U8WufkkE81E5bziCI1m3RYYUVeoqGukzfujshi2OwV9EBpAIWgDmdZNA3UBDwd6Q0ocq2/EvPfzzNZgNbeQObT+DutokxYEz2e8DlZU0ek46JsxTOFQShlNKoOeHUiXMfjfwUc3j6KqYRNUF1VV9xOzML2W9/+l73r6SnmrPVMItghOEzVivQgZ6gtk3Y901stV4yxTB+RFXO89EFbGYF4C2zhGvdssKxuWibjan9P5D6f/00E6uAb4ehy5MT5Cfj7Iy0Wqo8AmKTOFWOJU8BOjDOu7Odbgi8Xs6dNp</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>'
 $updateFiles = @('finder.ps1', 'ui.ps1', 'vpk.ps1', 'lobbies.ps1', 'Buscar versus.bat')
@@ -285,7 +285,7 @@ function Get-CampaignKey([string]$map) {
 # La Web API no lista lobbies: lobbies.ps1 los pide al cliente de Steam usando el steam_api.dll
 # del juego (32 bits), en un PowerShell de 32 bits aparte. No necesita API key.
 # Arranca lobbies.ps1 sin esperarlo (Receive-LobbyHelper junta la respuesta)
-function Start-LobbyHelper([string]$dir, [string]$helperArgs) {
+function Start-LobbyHelper([string]$dir, [string]$helperArgs, [switch]$Stream) {
     $game = Find-L4D2Path
     if (-not $game) { throw 'No encuentro Left 4 Dead 2 instalado.' }
     $dll = Join-Path $game 'bin\steam_api.dll'
@@ -297,7 +297,9 @@ function Start-LobbyHelper([string]$dir, [string]$helperArgs) {
     $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
     $proc = [Diagnostics.Process]::Start($psi)
-    return @{ Proc = $proc; Out = $proc.StandardOutput.ReadToEndAsync(); Err = $proc.StandardError.ReadToEndAsync() }
+    $err = $proc.StandardError.ReadToEndAsync()
+    if ($Stream) { return @{ Proc = $proc; Err = $err } }   # el que lo lanzó lee la salida línea por línea
+    return @{ Proc = $proc; Out = $proc.StandardOutput.ReadToEndAsync(); Err = $err }
 }
 
 function Receive-LobbyHelper($h) {
@@ -567,20 +569,34 @@ function Get-HistoryServers {
     return @([regex]::Matches($t, '"address"\s+"(\d{1,3}(?:\.\d{1,3}){3}:\d{1,5})"') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
 }
 
+# Lista de servers versus con gente y lugar, pedida al cliente de Steam como el navegador de servidores
+# del juego (lobbies.ps1 -Servers): no necesita API key. Devuelve direcciones "ip:puerto".
+function Get-SteamServerList([string]$dir) {
+    $json = Receive-LobbyHelper (Start-LobbyHelper $dir '-Servers')
+    return @(($json | ConvertFrom-Json) | ForEach-Object { $_ } | Where-Object { $_ })
+}
+
 function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValve, [scriptblock]$OnStatus) {
-    if (-not (Test-Path $keyFile)) { throw "Falta apikey.txt en $here" }
-    $key = (Get-Content $keyFile -Raw).Trim()
-
     & $OnStatus 'Pidiendo la lista de servidores a Steam...'
-    $filter = '\appid\550\empty\1\notfull\1'
-    $url = "https://api.steampowered.com/IGameServersService/GetServerList/v1/?key=$key&limit=5000&filter=" + [uri]::EscapeDataString($filter)
-    $srvList = @((Invoke-RestMethod -Uri $url -TimeoutSec 20).response.servers)
+    # 1) Al cliente de Steam (sin key). 2) Si falla y hay API key, a la Web API como antes.
+    $srvList = $null; $clientError = $null
+    try { $srvList = @(Get-SteamServerList $here | ForEach-Object { [pscustomobject]@{ addr = $_; gametype = 'versus'; name = ''; players = 0; max_players = 0 } }) }
+    catch { $clientError = $_.Exception.Message }
+    if ($null -eq $srvList) {
+        if (-not (Test-Path $keyFile)) { throw "No pude pedirle la lista de servidores a Steam: $clientError" }
+        $key = (Get-Content $keyFile -Raw).Trim()
+        $filter = '\appid\550\empty\1\notfull\1'
+        $url = "https://api.steampowered.com/IGameServersService/GetServerList/v1/?key=$key&limit=5000&filter=" + [uri]::EscapeDataString($filter)
+        $srvList = @((Invoke-RestMethod -Uri $url -TimeoutSec 20).response.servers)
+    }
 
+    # (La lista del cliente ya viene filtrada por Steam y sin datos: los filtros de verdad van despues del ping)
     $pre = @($srvList | Where-Object {
             (Test-VersusServer "$($_.gametype)" "$($_.name)") -and
-            ($_.max_players - $_.players) -ge $p -and
-            # Los competitivos declaran 14-30 lugares para espectadores: el tamano real se mira despues
-            ($includeBig -or $_.max_players -le 8 -or $_.gametype -match 'confogl') -and
+            ($_.max_players -eq 0 -or (
+                ($_.max_players - $_.players) -ge $p -and
+                # Los competitivos declaran 14-30 lugares para espectadores: el tamano real se mira despues
+                ($includeBig -or $_.max_players -le 8 -or $_.gametype -match 'confogl'))) -and
             -not ($hideValve -and $_.name -like 'Valve Left4Dead 2*')
         })
     # Sumar el historial de Steam (lo que no este ya en la lista publica)
@@ -815,18 +831,22 @@ function Send-SteamBroadcast([string]$me, [bool]$playing, [string]$server, [stri
 
 # Grupo: el que tilda "Seguirlo" avisa cada 30 s a quien sigue, en un canal aparte (asi las versiones
 # viejas de la app no lo confunden con una transmision de partida). Solo viajan huellas: {h = yo, f = a quien sigo}.
-$followTopic = Get-Topic 'steam-follow-v1'
+$followTopic = Get-Topic 'steam-follow-v2'   # v2: avisos cada 4 min que valen 10 min (v1 era cada 30 s)
 
-function Send-FollowSignal([string]$me, [string]$leader) {
+# Todas las apps avisan (con o sin grupo): asi tus amigos ven que tenes la app abierta y en que grupo estas.
+# $Closed = se cerro la app (deja de figurar enseguida, sin esperar a que venza el aviso).
+function Send-FollowSignal([string]$me, [string]$leader, [switch]$Closed) {
     $fh = if ($leader) { Get-SidHash $leader } else { '' }
-    $body = @{ h = (Get-SidHash $me); f = $fh } | ConvertTo-Json -Compress
+    $msg = @{ h = (Get-SidHash $me); f = $fh }
+    if ($Closed) { $msg.c = 1 }
+    $body = $msg | ConvertTo-Json -Compress
     [void](Invoke-RestMethod -Method Post -Uri "https://ntfy.sh/$followTopic" -TimeoutSec 5 `
             -Body ([Text.Encoding]::UTF8.GetBytes($body)) -ContentType 'text/plain; charset=utf-8')
 }
 
 # Trae los avisos de los dos canales en UN solo pedido (ntfy limita la cantidad de pedidos)
 function Receive-NtfyMessages([string]$since = '3m') {
-    $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 8 -Uri "https://ntfy.sh/$presenceTopic,$followTopic/json?poll=1&since=$since"
+    $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 8 -Uri "https://ntfy.sh/$followTopic/json?poll=1&since=$since"
     $text = [Text.Encoding]::UTF8.GetString($r.RawContentStream.ToArray())
     $out = foreach ($line in ($text -split "`n")) {
         if (-not $line.Trim()) { continue }
@@ -849,7 +869,36 @@ function Get-GroupHashes([string]$leader, $msgs) {
         if ($h -notmatch '^[0-9a-f]{16}$') { continue }
         if (-not $last.ContainsKey($h) -or $m.Time -ge $last[$h].Time) { $last[$h] = $m }
     }
-    return @($last.Keys | Where-Object { "$($last[$_].Data.f)" -eq $lh -and ($now - $last[$_].Time) -le 75 -and $_ -ne $lh })
+    return @($last.Keys | Where-Object { "$($last[$_].Data.f)" -eq $lh -and ($now - $last[$_].Time) -le 600 -and $_ -ne $lh })
+}
+
+# Ultimo aviso vigente de cada app: huella -> huella de a quien sigue ('' = a nadie: es lider o esta solo).
+# Las apps cerradas o con el aviso vencido (20 min: cada app avisa cada 9) no figuran.
+function Get-PartyMap($msgs, [int]$validity = 1200) {
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $last = @{}
+    foreach ($m in $msgs) {
+        if ($m.Topic -ne $followTopic) { continue }
+        $h = "$($m.Data.h)"
+        if ($h -notmatch '^[0-9a-f]{16}$') { continue }
+        if (-not $last.ContainsKey($h) -or $m.Time -ge $last[$h].Time) { $last[$h] = $m }
+    }
+    $map = @{}
+    foreach ($h in $last.Keys) {
+        $m = $last[$h]
+        if (($now - $m.Time) -gt $validity -or "$($m.Data.c)" -eq '1') { continue }
+        $map[$h] = "$($m.Data.f)"
+    }
+    return $map
+}
+
+# Lider final de una huella siguiendo la cadena (A sigue a B que sigue a C -> C). Si hay un ciclo, la menor.
+function Get-PartyRoot([string]$h, $map) {
+    $seen = New-Object 'System.Collections.Generic.List[string]'
+    $cur = $h
+    while ($cur -and $map.ContainsKey($cur) -and $map[$cur] -and -not $seen.Contains($cur)) { $seen.Add($cur); $cur = $map[$cur] }
+    if ($seen.Contains($cur)) { return ($seen | Sort-Object | Select-Object -First 1) }
+    return $cur
 }
 
 # Avatares desde el perfil publico de Steam (no hace falta API key). Devuelve steamid -> bytes de la imagen.

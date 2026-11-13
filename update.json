@@ -1,12 +1,12 @@
 {
-    "version":  4,
-    "notes":  "bugfix",
-    "date":  "2026-11-13 00:33",
+    "version":  5,
+    "notes":  "Look L4D2, partidas en curso sin API key, grupos con lider, avisos al instante e icono nuevo",
+    "date":  "2026-11-13 12:34",
     "files":  {
-                  "finder.ps1":  "701e05e0361251da4bb2ea5231f7c71e209c87462fc61c26099df56bf5c6741a",
-                  "ui.ps1":  "75351a63aaaf7a2454577ac59be201ca7806fe5c7a20742d1a7563128be50465",
-                  "vpk.ps1":  "a85192ddf8d824527443bbe6fe620e074dbbfad3cd68a7064e626e119a72fd5e",
-                  "lobbies.ps1":  "a3d7176a0cc98b62679105074c7fea98871717e24573670fe173ded7a0e3c520",
+                  "finder.ps1":  "e7e92a6668b6c2739dddc37ca6de6406760daf32b8c9819ca2679874e4103d56",
+                  "ui.ps1":  "36452beed2622eecef753d031a68aee8d0d4b8febd9f40e4b09ebe6ae60fed6d",
+                  "vpk.ps1":  "a33358afe20ca8d31901f90d36340322c476b68899215d26a9ee91daad9d40c5",
+                  "lobbies.ps1":  "ce492d3df6a5688f9c643eb48c9da33c432c87ad2c43953e456f61645c7817ca",
                   "Buscar versus.bat":  "608546897db095fcb0bc007ee31048185cddc1d8862f04cc2a74e0318628fcb6"
               }
 }
