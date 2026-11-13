@@ -1,0 +1,8 @@
+# Nunca subir: tu API key, tu configuracion, imagenes extraidas, temporales
+apikey.txt
+settings.json
+mapas/
+update-tmp/
+*.zip
+probe.ps1
+resultado-*.txt

@@ -1,0 +1,12 @@
+{
+    "version":  2,
+    "notes":  "Primera versión con actualizaciones automáticas",
+    "date":  "2026-11-12 21:31",
+    "files":  {
+                  "finder.ps1":  "55781e616ded77ef9529d381501ae9d0b3bf508cb7710b9577cfe4cbf45ef66e",
+                  "ui.ps1":  "a4878feda472fbc3e858e524200619e9c9145d1f5734d260772610c485f5fb68",
+                  "vpk.ps1":  "a85192ddf8d824527443bbe6fe620e074dbbfad3cd68a7064e626e119a72fd5e",
+                  "lobbies.ps1":  "6583f3a89d992484a68aff0fe9893f8c1c2acf1ee3bf6652be920f8a0a75ebd6",
+                  "Buscar versus.bat":  "608546897db095fcb0bc007ee31048185cddc1d8862f04cc2a74e0318628fcb6"
+              }
+}
