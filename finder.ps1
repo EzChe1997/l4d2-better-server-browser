@@ -28,7 +28,7 @@ $keyFile = Join-Path $here 'apikey.txt'
 # ======================= actualizaciones automaticas =======================
 # La app se fija si hay una version nueva publicada en GitHub. El indice (update.json) va firmado
 # con una clave que solo tiene quien publica: si la firma no coincide, la actualizacion se ignora.
-$AppVersion = 3
+$AppVersion = 4
 $updateBase = 'https://raw.githubusercontent.com/EzChe1997/l4d2-better-server-browser/main'   # lo completa publicar.ps1 (https://raw.githubusercontent.com/<usuario>/<repo>/main)
 $updatePublicKey = '<RSAKeyValue><Modulus>3uVFz1ZH9ed0Zun/YcmPi4gk8EALr+R7/DYQY+Fz5NArgRYEo1iNfjNpBUn7G3R0Tliw5DjecmnM0/InLrFLJl2BgMmwJo0VBw4BJ/7qmQm1q7oJoZ0mjI8cgxynbgyhARnQY3i9lVnEGfwB3IOnYhire7XM6iFxui9b5fOd3npzorhJakLqdMdPLBc7BT5VE8E/MfeyhlhusGlKpgsB4QWY3U8WufkkE81E5bziCI1m3RYYUVeoqGukzfujshi2OwV9EBpAIWgDmdZNA3UBDwd6Q0ocq2/EvPfzzNZgNbeQObT+DutokxYEz2e8DlZU0ek46JsxTOFQShlNKoOeHUiXMfjfwUc3j6KqYRNUF1VV9xOzML2W9/+l73r6SnmrPVMItghOEzVivQgZ6gtk3Y901stV4yxTB+RFXO89EFbGYF4C2zhGvdssKxuWibjan9P5D6f/00E6uAb4ehy5MT5Cfj7Iy0Wqo8AmKTOFWOJU8BOjDOu7Odbgi8Xs6dNp</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>'
 $updateFiles = @('finder.ps1', 'ui.ps1', 'vpk.ps1', 'lobbies.ps1', 'Buscar versus.bat')
@@ -337,7 +337,7 @@ function Get-OfficialLobbyMatch($servers, [string]$json) {
         foreach ($s in $servers) {
             if ($s.Map -notmatch '^(c\d+)m(\d+)_' -or $Matches[1] -ne $camp -or [int]$Matches[2] -ne $ch) { continue }
             $diff = [math]::Abs($s.Humans - $n)
-            if ($diff -le 1) { [pscustomobject]@{ Addr = $s.Addr; Lobby = [string]$l._id; Mode = [string]$l.'Game:mode'; Diff = $diff; Ping = $s.Ping } }
+            if ($diff -le 1) { [pscustomobject]@{ Addr = $s.Addr; Lobby = [string]$l._id; Mode = [string]$l.'Game:mode'; Diff = $diff; Ping = $s.Ping; Free = [int]$l._limit - [int]$l._members } }
         }
     }
     # Primero las salas versus; las mutaciones de versus solo con los servers que sobran
@@ -347,7 +347,7 @@ function Get-OfficialLobbyMatch($servers, [string]$json) {
     $match = @{}; $usedLobby = @{}
     foreach ($p in @($pairs | Sort-Object { [int]($_.Mode -ne 'versus') }, Diff, Ping)) {
         if ($match.ContainsKey($p.Addr) -or $usedLobby.ContainsKey($p.Lobby)) { continue }
-        $match[$p.Addr] = $p.Mode; $usedLobby[$p.Lobby] = $true
+        $match[$p.Addr] = $p; $usedLobby[$p.Lobby] = $true
     }
     return $match
 }
@@ -638,8 +638,13 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
         $friendsOnly = $false
         if ($isValve -and $null -ne $offMatch) {
             if (-not $offMatch.ContainsKey($s.Addr)) { $friendsOnly = $true }
-            elseif ($offMatch[$s.Addr] -ne 'versus') { $mutation = $true }
+            elseif ($offMatch[$s.Addr].Mode -ne 'versus') { $mutation = $true }
         }
+        # Oficial con sala publica: se entra por la SALA, no conectando al server. Asi siempre es una partida
+        # publica (el cruce sala<->server es aproximado, y conectar directo a un server ajeno te mete en
+        # cualquier partida, aunque sea privada o de solo amigos).
+        $lobbyLink = ''
+        if ($isValve -and $null -ne $offMatch -and $offMatch.ContainsKey($s.Addr)) { $lobbyLink = "steam://joinlobby/550/$($offMatch[$s.Addr].Lobby)" }
 
         # Config competitiva: la variable del server; si no la publica, el nombre del server.
         $cfg = if ($rules.ContainsKey($s.Addr)) { "$($rules[$s.Addr])" } else { '' }
@@ -674,7 +679,7 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
             Jugadores = "$h/$effMax"; Nombre = $s.Name; Mapa = $s.Map
             Pista = $hint; Addr = $s.Addr
             Hint = $v.Hint; Valve = ($s.Name -like 'Valve Left4Dead 2*'); Max = $effMax; Humans = $h
-            Premade = $premade; FriendsOnly = $friendsOnly; Mutation = $mutation
+            Premade = $premade; FriendsOnly = $friendsOnly; Mutation = $mutation; Link = $lobbyLink
             Campaign = (Get-CampaignKey $s.Map); Config = $cfg; Competitive = $competitive; ZoneMod = $zoneMod; Team = $team
         }
     }
@@ -799,8 +804,11 @@ function Get-SidHash([string]$sid) {
     return (($hash[0..7] | ForEach-Object { $_.ToString('x2') }) -join '')
 }
 
-function Send-SteamBroadcast([string]$me, [bool]$playing, [string]$server, [string]$lobby) {
-    $body = @{ h = (Get-SidHash $me); playing = $playing; server = $server; lobby = $lobby } | ConvertTo-Json -Compress
+# $join = lo eligió recién en la app (Unirme): los que lo siguen van enseguida, sin esperar a confirmarlo
+function Send-SteamBroadcast([string]$me, [bool]$playing, [string]$server, [string]$lobby, [bool]$join = $false) {
+    $msg = @{ h = (Get-SidHash $me); playing = $playing; server = $server; lobby = $lobby }
+    if ($join) { $msg.join = 1 }
+    $body = $msg | ConvertTo-Json -Compress
     [void](Invoke-RestMethod -Method Post -Uri "https://ntfy.sh/$presenceTopic" -TimeoutSec 8 `
             -Body ([Text.Encoding]::UTF8.GetBytes($body)) -ContentType 'text/plain; charset=utf-8')
 }
@@ -873,7 +881,7 @@ function Receive-SteamBroadcasts([string[]]$sids, [string]$since = '3m', $msgs =
         # Solo aceptamos IP:puerto y un id de lobby numerico, nada de otros comandos steam://
         $server = if ("$($d.server)" -match '^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$') { "$($d.server)" } else { '' }
         $lobby = if ("$($d.lobby)" -match '^\d{15,20}$') { "$($d.lobby)" } else { '' }
-        $obj = [pscustomobject]@{ SteamId = $sid; Name = ''; Playing = [bool]$d.playing; Server = $server; Lobby = $lobby; Time = [long]$m.time }
+        $obj = [pscustomobject]@{ SteamId = $sid; Name = ''; Playing = [bool]$d.playing; Server = $server; Lobby = $lobby; Time = [long]$m.time; Join = ("$($d.join)" -eq '1') }
         if (-not $latest.ContainsKey($sid) -or $obj.Time -ge $latest[$sid].Time) { $latest[$sid] = $obj }
     }
     return $latest

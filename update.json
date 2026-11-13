@@ -1,10 +1,10 @@
 {
-    "version":  3,
-    "notes":  "bugfixes",
-    "date":  "2026-11-12 23:43",
+    "version":  4,
+    "notes":  "bugfix",
+    "date":  "2026-11-13 00:33",
     "files":  {
-                  "finder.ps1":  "93e512e2c835339f16a6cf1caf11796388707e2e87ebac438060019258110b2b",
-                  "ui.ps1":  "eadafa5672bf51041c1edc512009c6b8e701a8238aec449400a0e83656d3d7b7",
+                  "finder.ps1":  "701e05e0361251da4bb2ea5231f7c71e209c87462fc61c26099df56bf5c6741a",
+                  "ui.ps1":  "75351a63aaaf7a2454577ac59be201ca7806fe5c7a20742d1a7563128be50465",
                   "vpk.ps1":  "a85192ddf8d824527443bbe6fe620e074dbbfad3cd68a7064e626e119a72fd5e",
                   "lobbies.ps1":  "a3d7176a0cc98b62679105074c7fea98871717e24573670fe173ded7a0e3c520",
                   "Buscar versus.bat":  "608546897db095fcb0bc007ee31048185cddc1d8862f04cc2a74e0318628fcb6"

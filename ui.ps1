@@ -32,7 +32,7 @@ $iss = [Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
 foreach ($fn in 'Get-Topic', 'Get-SidHash', 'Send-SteamBroadcast', 'Receive-SteamBroadcasts', 'Get-SteamStatus',
     'Get-LocalFriends', 'Get-ApiKey', 'Find-L4D2Path', 'Read-VpkIndex', 'Read-VpkFile', 'Export-MapImages', 'Get-LobbyJson',
     'Receive-NtfyMessages', 'Send-FollowSignal', 'Get-GroupHashes', 'Get-SteamAvatars', 'Get-WorkshopImages', 'Get-InstalledAddonMaps',
-    'Install-Update', 'Get-MySteamId') {
+    'Install-Update', 'Get-MySteamId', 'Start-LobbyHelper', 'Receive-LobbyHelper') {
     $iss.Commands.Add((New-Object Management.Automation.Runspaces.SessionStateFunctionEntry($fn, (Get-Item "function:$fn").Definition)))
 }
 foreach ($v in 'presenceTopic', 'followTopic', 'keyFile') {
@@ -326,7 +326,7 @@ $chkSteamFollow.Text = 'Seguirlo'; $chkSteamFollow.AutoSize = $true
 $chkSteamFollow.ForeColor = $C.Text; $chkSteamFollow.Checked = [bool]$settings.SteamFollow
 $chkSteamFollow.Margin = New-Object Windows.Forms.Padding(16, 5, 0, 0)
 (New-Object Windows.Forms.ToolTip).SetToolTip($chkSteamFollow, 'Te lleva solo a su server o lobby cada vez que se mueve. Se pausa y reactiva con la tecla de al lado, también desde el juego.')
-$btnFollowKey = New-FlatButton 'Tecla: F5' $C.CardHi (RGB 66 70 80) 96 26
+$btnFollowKey = New-FlatButton 'Tecla: F5' $C.CardHi (RGB 66 70 80) 140 26
 $btnFollowKey.Font = $F.Body; $btnFollowKey.Margin = New-Object Windows.Forms.Padding(6, 0, 0, 0)
 (New-Object Windows.Forms.ToolTip).SetToolTip($btnFollowKey, 'Tecla para activar/pausar Seguir, también con el juego abierto. Clic para cambiarla.')
 $chkShare = New-Object Windows.Forms.CheckBox
@@ -676,6 +676,19 @@ $list.add_Resize({
 function Invoke-Join([string]$link) {
     Write-AppLog "Unirme (botón): $link"
     Start-Process $link
+    # Avisar ya a los que te siguen (sin esperar a que Steam muestre tu nuevo estado, que tarda ~10 s)
+    if ($chkShare.Visible -and $chkShare.Checked -and $script:me) {
+        $srv = ''; $lob = ''
+        if ($link -match '^steam://connect/(\d{1,3}(?:\.\d{1,3}){3}:\d{1,5})$') { $srv = $Matches[1] }
+        elseif ($link -match '^steam://joinlobby/550/(\d{15,20})') { $lob = $Matches[1] }
+        if ($srv -or $lob) {
+            $script:intentLobby = $lob; $script:intentUntil = (Get-Date).AddSeconds(25)
+            Start-Async 'intent' { param($me, $srv, $lob) Send-SteamBroadcast $me $true $srv $lob $true } @($script:me, $srv, $lob) {
+                param($res, $err)
+                if ($err) { Write-AppLog "No pude avisar a mis seguidores: $err" } else { Write-AppLog 'Aviso instantáneo enviado a mis seguidores.' }
+            }
+        }
+    }
     if ($link -like 'steam://joinlobby/*') {
         $status.Text = 'Entrando a la sala...  Si "Compartir mi partida" está tildado, tus amigos que te siguen entran solos.'
     } else {
@@ -754,6 +767,7 @@ $script:followLobby = ''
 $script:joinedServer = ''   # ultimo server al que te llevó (no se borra al destildar)
 $script:pendingAction = ''; $script:pendingSince = Get-Date; $script:leaderState = ''; $script:leaderLobby = ''; $script:followedFor = ''; $script:myName = ''
 $script:followKeyName = 'La casilla'
+$script:intentUntil = [datetime]::MinValue; $script:intentLobby = ''; $script:streamPending = $false
 $script:lobbyJoinedAt = [datetime]::MinValue
 $script:shareState = ''
 $script:shareSentAt = [datetime]::MinValue
@@ -987,7 +1001,7 @@ $friendsTimer.Start()
 # --- seguir: escuchar la transmision del amigo elegido cada 6 segundos ---
 $steamTimer = New-Object Windows.Forms.Timer
 $steamTimer.Interval = 6000
-$steamTimer.add_Tick({
+function Invoke-FollowCheck {
         if (-not $chkSteamFollow.Checked) { return }
         $fid = Get-FollowedId
         if (-not $fid) { return }
@@ -1025,7 +1039,7 @@ $steamTimer.add_Tick({
             if ($b.Server) {
                 if ($b.Server -eq $script:joinedServer) {
                     $status.Text = "Estás en el server de $name ($($b.Server)). Si se cambia de server o arma otro lobby, te llevo."
-                } elseif ($script:followLobby -and ($b.Lobby -eq $script:followLobby -or (-not $b.Lobby -and $prevLobby -eq $script:followLobby))) {
+                } elseif (-not $b.Join -and $script:followLobby -and ($b.Lobby -eq $script:followLobby -or (-not $b.Lobby -and $prevLobby -eq $script:followLobby))) {
                     $script:joinedServer = $b.Server
                     Write-AppLog "Su lobby arrancó en $($b.Server): entrás con el lobby, no mando nada."
                     $status.Text = "La partida del lobby de $name arrancó en $($b.Server): entrás con el lobby."
@@ -1038,6 +1052,11 @@ $steamTimer.add_Tick({
                 $status.Text = "$name está en el menú del juego. Cuando entre a un server o arme un lobby, te llevo."
             }
             if (-not $action) { $script:pendingAction = ''; return }
+            # Lo eligió recién en la app (Unirme): ir ya, sin esperar a confirmarlo
+            if ($b.Join -and ((Get-UnixNow) - $b.Time) -le 30 -and $script:pendingAction -ne $action) {
+                $script:pendingAction = $action; $script:pendingSince = (Get-Date).AddMinutes(-1)
+                Write-AppLog "$name eligió en la app: $action (voy ya)"
+            }
             if ($script:pendingAction -ne $action) {
                 $script:pendingAction = $action; $script:pendingSince = Get-Date
                 Write-AppLog "Nuevo destino, lo confirmo en unos segundos: $action"
@@ -1048,9 +1067,7 @@ $steamTimer.add_Tick({
             $kind, $target = $action -split '\|', 2
             if ($kind -eq 'lobby') {
                 $script:followLobby = $target; $script:joinedServer = ''
-                Write-AppLog "ORDEN: steam://joinlobby/550/$target/$fid"
-                [System.Media.SystemSounds]::Asterisk.Play()
-                Start-Process "steam://joinlobby/550/$target/$fid"
+                Invoke-FollowCommand "steam://joinlobby/550/$target/$fid"
                 $status.Text = "$name armó un lobby. Te llevo... (para dejar de seguirlo: $($script:followKeyName))"
                 return
             }
@@ -1078,13 +1095,13 @@ $steamTimer.add_Tick({
                     return
                 }
                 if ($script:checkLobby) { $script:followLobby = $script:checkLobby }   # entrar a su server te mete en su lobby
-                Write-AppLog "ORDEN: steam://connect/$target  (nombres en el server: $(if ($chk) { @($chk.Names).Count } else { '?' }); yo='$($script:myName)')"
-                [System.Media.SystemSounds]::Asterisk.Play()
-                Start-Process "steam://connect/$target"
+                Write-AppLog "No te vi en $target (nombres en el server: $(if ($chk) { @($chk.Names).Count } else { '?' }); yo='$($script:myName)')"
+                Invoke-FollowCommand "steam://connect/$target"
                 $status.Text = "$who está en el server $($target): te llevo. (para dejar de seguirlo: $($script:followKeyName))"
             }
         }
-    })
+}
+$steamTimer.add_Tick({ Invoke-FollowCheck })
 $steamTimer.Start()
 
 # --- compartir: mirar mi estado en Steam cada 5 s y transmitirlo si cambio (o cada 60 s mientras juego) ---
@@ -1093,17 +1110,21 @@ $shareTimer.Interval = 5000
 $shareTimer.add_Tick({
         if (-not $chkShare.Visible -or -not $chkShare.Checked -or -not $script:me) { return }
         Start-Async 'share' {
-            param($me, $lastState, $lastSentTicks)
+            param($me, $lastState, $lastSentTicks, $intentUntilTicks, $intentLobby)
             $key = Get-ApiKey
             if (-not $key) { return }
             $mine = (Get-SteamStatus $key @($me))[$me]
             if (-not $mine) { return }
             $state = "$($mine.InL4D2)|$($mine.Server)|$($mine.Lobby)"
+            # Recién avisé con Unirme: no mandar el estado intermedio (lobby sin server todavía)
+            if ([datetime]::Now.Ticks -lt $intentUntilTicks -and -not $mine.Server -and $mine.Lobby -ne $intentLobby) {
+                return [pscustomobject]@{ State = $lastState; Sent = $false; Mine = $mine }
+            }
             $due = $mine.InL4D2 -and (([datetime]::Now.Ticks - $lastSentTicks) / 1e7) -ge 60
             $sent = $false
             if ($state -ne $lastState -or $due) { Send-SteamBroadcast $me $mine.InL4D2 $mine.Server $mine.Lobby; $sent = $true }
             [pscustomobject]@{ State = $state; Sent = $sent; Mine = $mine }
-        } @($script:me, $script:shareState, $script:shareSentAt.Ticks) {
+        } @($script:me, $script:shareState, $script:shareSentAt.Ticks, $script:intentUntil.Ticks, [string]$script:intentLobby) {
             param($res, $err)
             $r = Get-First $res
             if ($err -or -not $r -or -not $r.Sent) { return }
@@ -1136,6 +1157,102 @@ $cmbFriend.add_SelectedIndexChanged({
             $script:followedFor = $fid; $script:followLobby = ''; $script:joinedServer = ''; $script:pendingAction = ''; $script:leaderState = ''; $script:leaderLobby = ''
         }
     })
+
+# --- volver a poner el juego adelante despues de mandarle una orden ---
+# Abrir un link steam:// le saca el foco al juego (en pantalla completa se minimiza). Si el juego estaba
+# adelante cuando la app mando la orden, durante 15 s se lo vuelve a traer cada vez que lo pierde.
+if (-not ('GameFocus' -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+public static class GameFocus {
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
+    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
+    [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr pid);
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool attach);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+    public static IntPtr Window() {
+        foreach (var p in Process.GetProcessesByName("left4dead2")) { if (p.MainWindowHandle != IntPtr.Zero) return p.MainWindowHandle; }
+        return IntPtr.Zero;
+    }
+    public static bool IsFront() { IntPtr h = Window(); return h != IntPtr.Zero && GetForegroundWindow() == h && !IsIconic(h); }
+    public static bool Restore() {
+        IntPtr h = Window();
+        if (h == IntPtr.Zero) return false;
+        if (GetForegroundWindow() == h && !IsIconic(h)) return true;
+        if (IsIconic(h)) ShowWindow(h, 9);   // SW_RESTORE
+        uint fg = GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero), me = GetCurrentThreadId();
+        bool att = fg != 0 && fg != me && AttachThreadInput(me, fg, true);
+        bool ok = SetForegroundWindow(h);
+        BringWindowToTop(h);
+        if (att) AttachThreadInput(me, fg, false);
+        if (!ok) { keybd_event(0x12, 0, 0, UIntPtr.Zero); keybd_event(0x12, 0, 2, UIntPtr.Zero); ok = SetForegroundWindow(h); }   // Alt: Windows deja cambiar el foco
+        return ok;
+    }
+}
+"@
+}
+$script:refocusUntil = [datetime]::MinValue
+$refocusTimer = New-Object Windows.Forms.Timer
+$refocusTimer.Interval = 300
+$refocusTimer.add_Tick({
+        if ((Get-Date) -gt $script:refocusUntil) { $refocusTimer.Stop(); return }
+        try { if (-not [GameFocus]::IsFront()) { $ok = [GameFocus]::Restore(); if (-not $script:refocusLogged) { Write-AppLog "El juego perdió el foco tras la orden: lo traigo de vuelta ($ok)"; $script:refocusLogged = $true } } } catch {}
+    })
+
+# Manda una orden steam:// al juego (seguir) y, si el juego estaba adelante, lo mantiene adelante
+function Invoke-FollowCommand([string]$url) {
+    $front = $false
+    try { $front = [GameFocus]::IsFront() } catch {}
+    Write-AppLog "ORDEN: $url  (juego adelante: $front)"
+    [System.Media.SystemSounds]::Asterisk.Play()
+    Start-Process $url
+    if ($front) { $script:refocusUntil = (Get-Date).AddSeconds(15); $script:refocusLogged = $false; $refocusTimer.Start() }
+}
+
+# --- aviso instantaneo: conexion abierta a ntfy (stream) para enterarse apenas el que seguis se mueve ---
+# El sondeo cada 6 s queda de respaldo. Llegan avisos de todos los usuarios: se filtra por la huella.
+$script:streamQ = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
+$script:streamCtl = [hashtable]::Synchronized(@{ Stop = $false })
+if (-not $Screenshot) {
+    $streamRs = [RunspaceFactory]::CreateRunspace(); $streamRs.Open()
+    $script:streamPs = [PowerShell]::Create(); $script:streamPs.Runspace = $streamRs
+    [void]$script:streamPs.AddScript({
+            param($topic, $q, $ctl)
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            while (-not $ctl.Stop) {
+                try {
+                    $req = [Net.HttpWebRequest]::Create("https://ntfy.sh/$topic/json")
+                    $req.Timeout = 15000; $req.ReadWriteTimeout = 120000   # ntfy manda un keepalive cada ~45 s
+                    $resp = $req.GetResponse()
+                    $sr = New-Object IO.StreamReader($resp.GetResponseStream())
+                    while (-not $ctl.Stop) {
+                        $line = $sr.ReadLine()
+                        if ($null -eq $line) { break }
+                        if ($line -like '*"event":"message"*') { $q.Enqueue($line) }
+                    }
+                    $resp.Close()
+                } catch { Start-Sleep -Seconds 5 }
+            }
+        }).AddArgument($presenceTopic).AddArgument($script:streamQ).AddArgument($script:streamCtl)
+    [void]$script:streamPs.BeginInvoke()
+}
+$streamTimer = New-Object Windows.Forms.Timer
+$streamTimer.Interval = 200
+$streamTimer.add_Tick({
+        $line = $null; $hit = $false
+        $fid = if ($chkSteamFollow.Checked) { Get-FollowedId } else { $null }
+        $want = if ($fid) { Get-SidHash $fid } else { $null }
+        while ($script:streamQ.TryDequeue([ref]$line)) { if ($want -and $line.Contains($want)) { $hit = $true } }
+        if ($hit) { $script:streamPending = $true }   # el que seguis mandó algo: mirar ya (sin esperar el sondeo)
+        if ($script:streamPending -and -not $script:busy['follow']) { $script:streamPending = $false; Invoke-FollowCheck }
+    })
+$streamTimer.Start()
 
 # --- tecla para activar/pausar "Seguirlo" desde el juego (global; por defecto F5) ---
 if (-not ('FollowHotKey' -as [type])) {
@@ -1295,6 +1412,7 @@ $form.add_Shown({
     })
 $form.add_FormClosing({
         try { [void]$hotKey.Set(0) } catch {}
+        $script:streamCtl.Stop = $true; $streamTimer.Stop(); $refocusTimer.Stop()
         Write-AppLog '=== App cerrada'
         $autoTimer.Stop(); $steamTimer.Stop(); $friendsTimer.Stop(); $shareTimer.Stop(); $pumpTimer.Stop(); $groupTimer.Stop(); $beatTimer.Stop()
         # Avisar que dejás el grupo (si no llega, el lider te saca solo al minuto y poco)
@@ -1346,3 +1464,7 @@ if ($Screenshot) {
         })
 }
 [void]$form.ShowDialog()
+# La conexion de avisos instantaneos queda bloqueada leyendo: cerrar el proceso del todo
+$script:streamCtl.Stop = $true
+try { $pool.Close() } catch {}
+[Environment]::Exit(0)
