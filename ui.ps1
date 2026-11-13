@@ -6,6 +6,12 @@ try {
     Add-Type -Name AppId -Namespace L4dShell -MemberDefinition '[DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern int SetCurrentProcessExplicitAppUserModelID(string id);'
     [void][L4dShell.AppId]::SetCurrentProcessExplicitAppUserModelID('L4D2.BuscadorDeVersus')
 } catch {}
+if (-not ('L4dShell.Redraw' -as [type])) {
+    Add-Type -Name Redraw -Namespace L4dShell -MemberDefinition ('[DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);' +
+        '[DllImport("user32.dll")] public static extern bool RedrawWindow(IntPtr h, IntPtr rect, IntPtr rgn, uint flags);' +
+        '[DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int i);' +
+        '[DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr h, int i, int v);')
+}
 . (Join-Path $here 'vpk.ps1')
 [Windows.Forms.Application]::EnableVisualStyles()
 
@@ -96,7 +102,47 @@ public class L4dLines {
 }
 "@
 }
-[Net.ServicePointManager]::DefaultConnectionLimit = 16   # la conexión abierta con ntfy no debe trabar los avisos que mandamos
+[Net.ServicePointManager]::DefaultConnectionLimit = 16
+# Tarjeta que, una vez armada, se pinta copiando su imagen directo a la pantalla (BitBlt): es lo más rápido
+# que hay en Windows, y así al scrollear rápido (incluso maximizada) no quedan rayas.
+if (-not ('L4dCard' -as [type])) {
+    Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @"
+using System;
+using System.Drawing;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+public class L4dCard : Panel {
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr hdc);
+    [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr hdc);
+    [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr hdc, IntPtr obj);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
+    [DllImport("gdi32.dll")] static extern bool BitBlt(IntPtr dst, int x, int y, int w, int h, IntPtr src, int sx, int sy, int rop);
+    IntPtr face = IntPtr.Zero;
+    public L4dCard() { SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint, true); }
+    public void SetFace(Bitmap b) {
+        Free();
+        face = b.GetHbitmap(Color.Black);
+        SetStyle(ControlStyles.Opaque, true);
+        Invalidate();
+    }
+    protected override void OnPaintBackground(PaintEventArgs e) { if (face == IntPtr.Zero) base.OnPaintBackground(e); }
+    protected override void OnPaint(PaintEventArgs e) {
+        if (face == IntPtr.Zero) { base.OnPaint(e); return; }
+        Rectangle r = e.ClipRectangle;
+        IntPtr hdc = e.Graphics.GetHdc();
+        try {
+            IntPtr mem = CreateCompatibleDC(hdc);
+            IntPtr old = SelectObject(mem, face);
+            BitBlt(hdc, r.X, r.Y, r.Width, r.Height, mem, r.X, r.Y, 0x00CC0020);
+            SelectObject(mem, old);
+            DeleteDC(mem);
+        } finally { e.Graphics.ReleaseHdc(hdc); }
+    }
+    void Free() { if (face != IntPtr.Zero) { DeleteObject(face); face = IntPtr.Zero; } }
+    protected override void Dispose(bool disposing) { Free(); base.Dispose(disposing); }
+}
+"@
+}   # la conexión abierta con ntfy no debe trabar los avisos que mandamos
 
 # Corre $work en segundo plano (uno a la vez por nombre) y despues llama $done con (resultado, error)
 function Start-Async([string]$name, [scriptblock]$work, [object[]]$argv, [scriptblock]$done) {
@@ -423,7 +469,88 @@ function Get-AppIcon {
     }
     try { return New-Object Drawing.Icon((New-Object IO.MemoryStream(, [IO.File]::ReadAllBytes($ico)))) } catch { return $null }
 }
-function Update-AppIcon { $i = Get-AppIcon; if ($i) { $form.Icon = $i } }
+function Update-AppIcon { $i = Get-AppIcon; if ($i) { $form.Icon = $i; Update-Shortcut } }
+
+# Acceso directo "Buscador de versus" al lado del .bat: con el ícono de la app (a un .bat no se le puede
+# cambiar el ícono), abre sin que parpadee la ventana negra y lleva la misma identidad que la ventana, así
+# se puede anclar a la barra de tareas como corresponde. Se rehace si falta o si la carpeta cambió de lugar.
+if (-not ('L4dShortcut' -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class L4dShortcut {
+    [ComImport, Guid("000214F9-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IShellLinkW {
+        void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder f, int n, IntPtr fd, uint fl);
+        void GetIDList(out IntPtr p); void SetIDList(IntPtr p);
+        void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder s, int n);
+        void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string s);
+        void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder s, int n);
+        void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string s);
+        void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder s, int n);
+        void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string s);
+        void GetHotkey(out short k); void SetHotkey(short k);
+        void GetShowCmd(out int c); void SetShowCmd(int c);
+        void GetIconLocation([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder s, int n, out int i);
+        void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string s, int i);
+        void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string s, uint r);
+        void Resolve(IntPtr h, uint fl);
+        void SetPath([MarshalAs(UnmanagedType.LPWStr)] string s);
+    }
+    [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IPropertyStore {
+        void GetCount(out uint c); void GetAt(uint i, out PropKey k);
+        void GetValue(ref PropKey k, out PropVar v); void SetValue(ref PropKey k, ref PropVar v); void Commit();
+    }
+    [ComImport, Guid("0000010b-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IPersistFile {
+        void GetClassID(out Guid g); [PreserveSig] int IsDirty();
+        void Load([MarshalAs(UnmanagedType.LPWStr)] string f, uint m);
+        void Save([MarshalAs(UnmanagedType.LPWStr)] string f, bool remember);
+        void SaveCompleted([MarshalAs(UnmanagedType.LPWStr)] string f);
+        void GetCurFile([MarshalAs(UnmanagedType.LPWStr)] out string f);
+    }
+    [StructLayout(LayoutKind.Sequential)] struct PropKey { public Guid fmtid; public uint pid; }
+    [StructLayout(LayoutKind.Sequential)] struct PropVar { public ushort vt; public ushort r1, r2, r3; public IntPtr p; public IntPtr p2; }
+    [ComImport, Guid("00021401-0000-0000-C000-000000000046")] class ShellLink { }
+
+    public static void Save(string lnk, string target, string args, string workDir, string icon, string desc, string appId, int showCmd) {
+        var link = (IShellLinkW)new ShellLink();
+        link.SetPath(target); link.SetArguments(args); link.SetWorkingDirectory(workDir);
+        link.SetIconLocation(icon, 0); link.SetDescription(desc); link.SetShowCmd(showCmd);
+        var store = (IPropertyStore)link;
+        var key = new PropKey { fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), pid = 5 };
+        var v = new PropVar { vt = 31, p = Marshal.StringToCoTaskMemUni(appId) };
+        try { store.SetValue(ref key, ref v); store.Commit(); } finally { Marshal.FreeCoTaskMem(v.p); }
+        ((IPersistFile)link).Save(lnk, true);
+        Marshal.ReleaseComObject(link);
+    }
+    public static string ReadArgs(string lnk) {
+        var link = (IShellLinkW)new ShellLink();
+        ((IPersistFile)link).Load(lnk, 0);
+        var sb = new StringBuilder(2048); link.GetArguments(sb, sb.Capacity);
+        Marshal.ReleaseComObject(link);
+        return sb.ToString();
+    }
+}
+"@
+}
+function Update-Shortcut {
+    if ($Screenshot -or $env:L4D2_TEST_NOGROUP) { return }
+    try {
+        $lnk = Join-Path $here 'Buscador de versus.lnk'
+        $ico = Join-Path $mapDir 'app.ico'
+        if (-not (Test-Path $ico)) { return }
+        $finderPath = Join-Path $here 'finder.ps1'
+        $lnkArgs = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$finderPath`""
+        if ((Test-Path $lnk) -and ([L4dShortcut]::ReadArgs($lnk) -eq $lnkArgs)) { return }
+        $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        # 7 = arranca minimizada: la consola de PowerShell no llega a verse antes de esconderse
+        [L4dShortcut]::Save($lnk, $ps, $lnkArgs, $here, $ico, 'Buscador de versus para Left 4 Dead 2', 'L4D2.BuscadorDeVersus', 7)
+        Write-AppLog 'Acceso directo "Buscador de versus" creado.'
+    } catch { Write-AppLog "No pude crear el acceso directo: $($_.Exception.Message)" }
+}
 Update-AppIcon
 
 # Filtros
@@ -596,7 +723,7 @@ $form.Controls.Add($filters)
 $form.Controls.Add($header)
 
 # ---------------- tarjetas ----------------
-function Get-CardWidth { return [math]::Max(600, $list.ClientSize.Width - $list.Padding.Horizontal - 4) }
+function Get-CardWidth { return [math]::Max(600, $list.Width - [Windows.Forms.SystemInformation]::VerticalScrollBarWidth - $list.Padding.Horizontal - 4) }   # haya barra o no, el mismo ancho
 
 function Get-PingColor([int]$ms) {
     if ($ms -le 60) { return $C.Green }
@@ -652,7 +779,7 @@ function New-Card($r) {
     $W = Get-CardWidth; $H = 120
     $statusColor = switch ($r.Estado) { 'Seguro' { $C.Green } 'Probable' { $C.Amber } default { $C.Gray } }
 
-    $card = New-Object Windows.Forms.Panel
+    $card = New-Object L4dCard
     $card.Size = New-Object Drawing.Size($W, $H); $card.BackColor = $C.Card
     $card.Margin = New-Object Windows.Forms.Padding(0, 0, 0, 10)
 
@@ -754,7 +881,23 @@ function New-Card($r) {
     $copy.add_Click({ Copy-Link $this.Tag })
 
     $card.Controls.AddRange(@($strip, $pic, $t, $name, $chips, $hint, $slots, $pips, $slotsSub, $ping, $join, $copy))
+    Convert-CardToImage $card @($join, $copy)
     return $card
+}
+
+# Una tarjeta armada con ~20 controles hace que al scrollear Windows no llegue a repintarlos y queden rayas
+# "corridas". Por eso, ya armada, se "fotografía" entera en una sola imagen de fondo y solo quedan vivos los
+# botones: al scrollear se mueven imágenes, que es instantáneo.
+function Convert-CardToImage($card, [object[]]$keep) {
+    try {
+        $bmp = New-Object Drawing.Bitmap($card.Width, $card.Height)
+        foreach ($k in $keep) { $k.Visible = $false }
+        $card.DrawToBitmap($bmp, (New-Object Drawing.Rectangle(0, 0, $card.Width, $card.Height)))
+        foreach ($k in $keep) { $k.Visible = $true }
+        foreach ($ctl in @($card.Controls | Where-Object { $keep -notcontains $_ })) { $card.Controls.Remove($ctl); $ctl.Dispose() }
+        $card.SetFace($bmp)
+        $bmp.Dispose()
+    } catch { foreach ($k in $keep) { $k.Visible = $true } }   # si falla, queda la tarjeta normal
 }
 
 function Show-Message([string]$text) {
@@ -763,6 +906,66 @@ function Show-Message([string]$text) {
     $list.Controls.Add($l)
 }
 
+# Cambios grandes (otra pestaña, otros filtros) sin parpadeo. Windows dibuja cada control por separado y,
+# cuando la lista se corre (al sacar o poner la fila de filtros), arrastra los píxeles viejos: por un instante
+# se ven tarjetas cortadas y textos encimados. Para evitarlo se tapa la ventana con una "foto" de cómo está,
+# se rearma todo abajo, se cambia la foto por una del resultado final (de un saque) y recién ahí se destapa:
+# lo que queda abajo es idéntico a la foto, así que no se nota nada.
+$script:freeze = 0
+$cover = New-Object Windows.Forms.PictureBox
+$cover.Visible = $false; $cover.SizeMode = 'Normal'; $cover.BackColor = $C.Bg
+$coverOff = New-Object Windows.Forms.Timer
+$coverOff.Interval = 60
+$coverOff.add_Tick({
+        $this.Stop()
+        $cover.Visible = $false
+        $img = $cover.Image; $cover.Image = $null; if ($img) { $img.Dispose() }
+    })
+function Get-FormPicture {
+    $sz = $form.ClientSize
+    $bmp = New-Object Drawing.Bitmap($sz.Width, $sz.Height)
+    $g = [Drawing.Graphics]::FromImage($bmp); $g.Clear($C.Bg); $g.Dispose()
+    # De atrás para adelante, cada bloque en su lugar (la tapa no)
+    $ctls = @($form.Controls | Where-Object { $_ -ne $cover -and $_.Visible })
+    [array]::Reverse($ctls)
+    foreach ($ctl in $ctls) {
+        if ($ctl.Width -le 0 -or $ctl.Height -le 0) { continue }
+        $part = New-Object Drawing.Bitmap($ctl.Width, $ctl.Height)
+        $ctl.DrawToBitmap($part, (New-Object Drawing.Rectangle(0, 0, $ctl.Width, $ctl.Height)))
+        $g = [Drawing.Graphics]::FromImage($bmp); $g.DrawImageUnscaled($part, $ctl.Left, $ctl.Top); $g.Dispose()
+        $part.Dispose()
+    }
+    return $bmp
+}
+function Invoke-Frozen([scriptblock]$work) {
+    $outer = $script:freeze -eq 0 -and $form.IsHandleCreated -and $form.Visible -and $form.WindowState -ne 'Minimized' -and -not $Screenshot
+    if ($outer) {
+        try {
+            $coverOff.Stop()
+            if (-not $form.Controls.Contains($cover)) { $form.Controls.Add($cover) }
+            $old = $cover.Image
+            $cover.Image = Get-FormPicture
+            if ($old) { $old.Dispose() }
+            $cover.Bounds = New-Object Drawing.Rectangle(0, 0, $form.ClientSize.Width, $form.ClientSize.Height)
+            $cover.BringToFront(); $cover.Visible = $true; $cover.Update()
+        } catch { $outer = $false }
+    }
+    $script:freeze++
+    try { . $work }
+    finally {
+        $script:freeze--
+        if ($outer) {
+            try {
+                $form.PerformLayout(); $list.PerformLayout()
+                $old = $cover.Image
+                $cover.Image = Get-FormPicture   # el resultado final, de una vez
+                if ($old) { $old.Dispose() }
+                $cover.Update()
+            } catch {}
+            $coverOff.Start()                    # destapar cuando lo de abajo ya se pintó igual
+        }
+    }
+}
 function Clear-List {
     $old = @($list.Controls | Where-Object { $_ -ne $spinPanel })
     $list.Controls.Clear()
@@ -885,8 +1088,11 @@ function Update-AddonMaps($addons) {
 }
 
 function Show-Rows {
+    if ($null -eq $script:results[$script:view]) { return }
+    Invoke-Frozen { Show-RowsCore }
+}
+function Show-RowsCore {
     $all = $script:results[$script:view]
-    if ($null -eq $all) { return }
     $lobbies = $script:view -eq 'lobbies'
     $sel = @(Get-SelectedCampaigns)
     $modes = @(Get-Picked $pickMode); $hosts = @(Get-Picked $pickHost)
@@ -896,6 +1102,7 @@ function Show-Rows {
             ($showFriendsOnly -or -not $_.FriendsOnly) -and ($showMutation -or -not $_.Mutation) })
     Clear-List
     $list.SuspendLayout()
+    $script:cardsWidth = Get-CardWidth
     foreach ($r in $rows) { $list.Controls.Add((New-Card $r)) }
     $list.ResumeLayout()
     Request-WorkshopImages
@@ -920,7 +1127,24 @@ function Show-Rows {
     $status.Text = "Mostrando $($rows.Count) de $($all.Count) $what ($seguros seguros).$hiddenTxt  Última búsqueda: $($script:times[$script:view])"
 }
 
-function Set-View([string]$v) {
+# Las tarjetas de la otra pestaña se guardan armadas: volver a una pestaña es instantáneo mientras no
+# cambien los resultados, los filtros, cuántos son ni las imágenes (si algo cambió, se rearman).
+$script:cardCache = @{}
+function Get-CardKey([string]$v) {
+    $id = { param($o) if ($null -eq $o) { 0 } else { [Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($o) } }
+    return @((& $id $script:results[$v]), ((Get-SelectedCampaigns) -join ','), ((Get-Picked $pickMode) -join ','),
+        ((Get-Picked $pickHost) -join ','), $chkFriendsOnly.Checked, $chkMutation.Checked, [int]$numParty.Value,
+        (& $id $script:imgCache), (Get-CardWidth)) -join '|'
+}
+function Remove-CardCache([string]$v) {
+    $entry = $script:cardCache[$v]   # (no usar $c: en PowerShell es lo mismo que $C, la paleta de colores)
+    if ($entry) { foreach ($ctl in $entry.Controls) { $ctl.Dispose() } }
+    $script:cardCache.Remove($v)
+}
+
+function Set-View([string]$v) { Invoke-Frozen { Set-ViewCore $v } }
+function Set-ViewCore([string]$v) {
+    $prev = $script:view
     $script:view = $v
     foreach ($b in $btnViewServers, $btnViewLobbies) {
         $on = $b.Tag -eq $v
@@ -934,7 +1158,26 @@ function Set-View([string]$v) {
     $filters.Visible = $v -eq 'servers'
     $subtitle.Text = if ($v -eq 'lobbies') { 'Left 4 Dead 2  ·  salas de espera con lugar para tu grupo' } else { 'Left 4 Dead 2  ·  servers con lugar para tu grupo' }
 
-    Clear-List
+    # Guardar las tarjetas de la pestaña que se deja (si no está buscando)
+    $kept = @($list.Controls | Where-Object { $_ -ne $spinPanel })
+    if ($prev -ne $v -and $null -ne $script:results[$prev] -and $kept.Count -and -not $list.Controls.Contains($spinPanel)) {
+        Remove-CardCache $prev
+        $script:cardCache[$prev] = @{ Key = (Get-CardKey $prev); Controls = $kept; Status = $status.Text; Scroll = $list.VerticalScroll.Value }
+        $list.Controls.Clear()
+    } else { Clear-List }
+
+    $entry = $script:cardCache[$v]   # (no usar $c: en PowerShell es lo mismo que $C, la paleta de colores)
+    if ($entry -and $null -ne $script:results[$v] -and $entry.Key -eq (Get-CardKey $v)) {
+        $script:cardCache.Remove($v)
+        $list.SuspendLayout()
+        $script:cardsWidth = Get-CardWidth
+        $list.Controls.AddRange([Windows.Forms.Control[]]$entry.Controls)
+        $list.ResumeLayout()
+        $list.AutoScrollPosition = New-Object Drawing.Point(0, $entry.Scroll)
+        $status.Text = $entry.Status
+        return
+    }
+    Remove-CardCache $v
     if ($null -ne $script:results[$v]) { Show-Rows }
     elseif ($btnSearch.Enabled) { $btnSearch.PerformClick() }
 }
@@ -985,12 +1228,19 @@ foreach ($pick in $pickMode, $pickHost) {
 }
 Update-CampButton
 
-$list.add_Resize({
-        $w = Get-CardWidth
-        $list.SuspendLayout()
-        foreach ($ctl in $list.Controls) { if ($ctl -is [Windows.Forms.Panel]) { $ctl.Width = $w } }
-        $list.ResumeLayout()
+# Las tarjetas son imágenes: si cambia el ancho de la ventana se vuelven a armar (cuando se termina de
+# agrandar/achicar, no en cada pixel del arrastre).
+$script:cardsWidth = 0
+$resizeTimer = New-Object Windows.Forms.Timer
+$resizeTimer.Interval = 200
+$resizeTimer.add_Tick({
+        $this.Stop()
+        if ((Get-CardWidth) -ne $script:cardsWidth -and @($list.Controls | Where-Object { $_ -is [L4dCard] }).Count) { Show-Rows }
     })
+$list.add_Resize({ $resizeTimer.Stop(); $resizeTimer.Start() })
+# Al scrollear, pintar ya mismo lo que quedó al descubierto (UPDATENOW | ALLCHILDREN), sin esperar turno
+$list.add_Scroll({ [void][L4dShell.Redraw]::RedrawWindow($list.Handle, [IntPtr]::Zero, [IntPtr]::Zero, 0x0180) })
+$list.add_MouseWheel({ [void][L4dShell.Redraw]::RedrawWindow($list.Handle, [IntPtr]::Zero, [IntPtr]::Zero, 0x0180) })
 
 # ---------------- acciones ----------------
 function Invoke-Join([string]$link) {
@@ -1812,6 +2062,29 @@ $form.add_FormClosing({
         $settings.MaxPing = [int]$numPing.Value
         if (-not $Screenshot) { Save-Settings $settings }   # las capturas de prueba no tocan la config
     })
+
+# Un error en la ventana queda anotado en eventos.log (con la línea) en vez de quedar solo en un cartel
+if (-not $Screenshot) {
+    [Windows.Forms.Application]::add_ThreadException({
+            param($s, $e)
+            $ex = $e.Exception
+            $where = ''
+            if ($ex -is [Management.Automation.RuntimeException] -and $ex.ErrorRecord.InvocationInfo) {
+                $ii = $ex.ErrorRecord.InvocationInfo; $where = " @ línea $($ii.ScriptLineNumber): $($ii.Line.Trim())"
+            }
+            Write-AppLog "ERROR: $($ex.GetType().Name): $($ex.Message)$where"
+            Write-AppLog "  $(($ex.StackTrace -split "`n" | Select-Object -First 6) -join ' | ')"
+            $status.Text = "Ups, algo falló (quedó anotado en eventos.log): $($ex.Message)"
+        })
+}
+
+# Pruebas sin tocar el grupo real: L4D2_TEST_NOGROUP=1 no avisa nada a ntfy ni guarda la configuración
+if ($env:L4D2_TEST_NOGROUP) {
+    function Send-Beat { }
+    function Start-GroupStream { }
+    function Send-FollowSignal { }
+    function Save-Settings { }
+}
 
 if ($Screenshot) {
     # Modo prueba: busca, saca una captura de la ventana y se cierra.
