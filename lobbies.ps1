@@ -17,6 +17,7 @@ param(
     [switch]$Dump,
     [switch]$Watch,          # modo vigia (ver abajo)
     [switch]$Servers,        # lista de servers de internet (ver abajo)
+    [switch]$StreamList,     # con -Servers: una direccion por linea apenas llega
     [string]$ServerFilter = 'gamedir=left4dead2,empty=1,notfull=1,gametagsand=versus',
     [int]$ParentPid = 0
 )
@@ -218,7 +219,9 @@ public static class L4dServerList {
         if (p == IntPtr.Zero) throw new Exception("falta " + n + " en steam_api.dll");
         return Marshal.GetDelegateForFunctionPointer(p, typeof(T)) as T;
     }
-    public static List<string> Fetch(string dll, string filterSpec, int timeoutMs) {
+    public static List<string> Fetch(string dll, string filterSpec, int timeoutMs) { return Fetch(dll, filterSpec, timeoutMs, null); }
+    // onAddr: se llama con cada direccion apenas Steam la da (para ir midiendo el ping sin esperar la lista entera)
+    public static List<string> Fetch(string dll, string filterSpec, int timeoutMs, Action<string> onAddr) {
         h = LoadLibraryW(dll);
         if (h == IntPtr.Zero) throw new Exception("no pude cargar " + dll);
         if (!F<D_Init>("SteamAPI_Init")()) throw new Exception("No me pude conectar a Steam: tiene que estar abierto y con tu cuenta iniciada.");
@@ -261,36 +264,56 @@ public static class L4dServerList {
             // La lista de direcciones llega de una (a veces en tandas): esperar a que deje de crecer.
             // No hace falta que Steam termine de consultar cada server: eso lo hace finder.ps1 mas rapido.
             var t0 = DateTime.Now; var lastChange = DateTime.Now; int last = -1;
+            var list = new List<string>();
+            var seen = new HashSet<string>();
+            int emitted = 0;
             while (true) {
                 run();
                 System.Threading.Thread.Sleep(100);
                 int n = count(mms, req);
+                for (; emitted < n; emitted++) {
+                    string a = Addr(details(mms, req, emitted));
+                    if (a != null && seen.Add(a)) { list.Add(a); if (onAddr != null) onAddr(a); }
+                }
                 if (n != last) { last = n; lastChange = DateTime.Now; }
                 double el = (DateTime.Now - t0).TotalMilliseconds;
                 if (complete) break;
                 if (n > 0 && (DateTime.Now - lastChange).TotalMilliseconds > 1200) break;
                 if (el > timeoutMs) break;
             }
-            var list = new List<string>();
-            var seen = new HashSet<string>();
             int total = count(mms, req);
-            for (int i = 0; i < total; i++) {
-                IntPtr p = details(mms, req, i);
-                if (p == IntPtr.Zero) continue;
-                // gameserveritem_t: servernetadr_t { uint16 puerto de juego; uint16 puerto de consulta; uint32 ip }
-                int qport = (ushort)Marshal.ReadInt16(p, 2);
-                uint ip = (uint)Marshal.ReadInt32(p, 4);
-                if (ip == 0 || qport == 0) continue;
-                string a = ((ip >> 24) & 255) + "." + ((ip >> 16) & 255) + "." + ((ip >> 8) & 255) + "." + (ip & 255) + ":" + qport;
-                if (seen.Add(a)) list.Add(a);
+            for (; emitted < total; emitted++) {
+                string a = Addr(details(mms, req, emitted));
+                if (a != null && seen.Add(a)) { list.Add(a); if (onAddr != null) onAddr(a); }
             }
             cancel(mms, req);
             release(mms, req);
             return list;
         } finally { shutdown(); }
     }
+    // gameserveritem_t: servernetadr_t { uint16 puerto de juego; uint16 puerto de consulta; uint32 ip }
+    static string Addr(IntPtr p) {
+        if (p == IntPtr.Zero) return null;
+        int qport = (ushort)Marshal.ReadInt16(p, 2);
+        uint ip = (uint)Marshal.ReadInt32(p, 4);
+        if (ip == 0 || qport == 0) return null;
+        return ((ip >> 24) & 255) + "." + ((ip >> 16) & 255) + "." + ((ip >> 8) & 255) + "." + (ip & 255) + ":" + qport;
+    }
 }
 "@
+    if ($StreamList) {
+        # Una direccion por linea apenas llega (y "END" al final): finder.ps1 va midiendo mientras tanto
+        try {
+            $out = [Console]::Out
+            [void][L4dServerList]::Fetch($Dll, $ServerFilter, 12000, [Action[string]] { param($a) $out.WriteLine($a); $out.Flush() })
+            $out.WriteLine('END'); $out.Flush()
+        } catch {
+            $e = $_.Exception; while ($e.InnerException) { $e = $e.InnerException }
+            [Console]::Out.WriteLine("ERROR: $($e.Message)")
+            exit 1
+        }
+        exit 0
+    }
     try {
         $list = [L4dServerList]::Fetch($Dll, $ServerFilter, 12000)
         [Console]::Out.Write((ConvertTo-Json -InputObject @($list) -Compress))

@@ -191,6 +191,7 @@ $pumpTimer.Interval = 150
 $script:searchState = $null
 $pumpTimer.add_Tick({
         if ($script:busy['servers'] -and $script:searchState -and $status.Text -ne $script:searchState.Msg) { $status.Text = $script:searchState.Msg }
+        if ($script:busy['servers']) { try { Add-LiveRows } catch { Write-AppLog "Error mostrando servers a medida que llegan: $($_.Exception.Message)" } }
         if ($script:busy['servers'] -and $script:searchState -and $script:searchState.Msg -ne $script:searchLogged) {
             $script:searchLogged = $script:searchState.Msg
             Write-AppLog "Búsqueda: $($script:searchLogged)"
@@ -576,20 +577,26 @@ public static class L4dShortcut {
 }
 "@
 }
+# Además va una copia en el menú Inicio: al anclar a Inicio, Windows busca el ícono de una app con identidad
+# propia (AppUserModelID) en un acceso directo del menú Inicio; sin esa copia el mosaico queda sin ícono.
+# De paso la app aparece en la lista de Inicio y en la búsqueda ("buscador").
 function Update-Shortcut {
     if ($Screenshot -or $env:L4D2_TEST_NOGROUP) { return }
-    try {
-        $lnk = Join-Path $here 'Buscador de versus.lnk'
-        $ico = Join-Path $mapDir 'app.ico'
-        if (-not (Test-Path $ico)) { return }
-        $finderPath = Join-Path $here 'finder.ps1'
-        $lnkArgs = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$finderPath`""
-        if ((Test-Path $lnk) -and ([L4dShortcut]::ReadArgs($lnk) -eq $lnkArgs)) { return }
-        $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        # 7 = arranca minimizada: la consola de PowerShell no llega a verse antes de esconderse
-        [L4dShortcut]::Save($lnk, $ps, $lnkArgs, $here, $ico, 'Buscador de versus para Left 4 Dead 2', 'L4D2.BuscadorDeVersus', 7)
-        Write-AppLog 'Acceso directo "Buscador de versus" creado.'
-    } catch { Write-AppLog "No pude crear el acceso directo: $($_.Exception.Message)" }
+    $ico = Join-Path $mapDir 'app.ico'
+    if (-not (Test-Path $ico)) { return }
+    $finderPath = Join-Path $here 'finder.ps1'
+    $lnkArgs = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$finderPath`""
+    $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $startMenu = [Environment]::GetFolderPath('Programs')
+    foreach ($lnk in @((Join-Path $here 'Buscador de versus.lnk'), $(if ($startMenu) { Join-Path $startMenu 'Buscador de versus.lnk' }))) {
+        if (-not $lnk) { continue }
+        try {
+            if ((Test-Path $lnk) -and ([L4dShortcut]::ReadArgs($lnk) -eq $lnkArgs)) { continue }
+            # 7 = arranca minimizada: la consola de PowerShell no llega a verse antes de esconderse
+            [L4dShortcut]::Save($lnk, $ps, $lnkArgs, $here, $ico, 'Buscador de versus para Left 4 Dead 2', 'L4D2.BuscadorDeVersus', 7)
+            Write-AppLog "Acceso directo creado: $lnk"
+        } catch { Write-AppLog "No pude crear el acceso directo ${lnk}: $($_.Exception.Message)" }
+    }
 }
 Update-AppIcon
 
@@ -622,12 +629,12 @@ $chkMutation.Checked = [bool]$settings.IncludeMutations; $chkMutation.Margin = N
 (New-Object Windows.Forms.ToolTip).SetToolTip($chkMutation, 'Servers versus con mutaciones u otro modo (realismo, Taaannnkk!, etc.).')
 # Experimental: primero los servers "ideales" (poco ping y los lugares justos para el grupo, así se llena)
 $chkIdeal = New-Object Windows.Forms.CheckBox
-$chkIdeal.Text = 'Primero los ideales (experimental)'; $chkIdeal.AutoSize = $true; $chkIdeal.ForeColor = $C.Text
+$chkIdeal.Text = 'Primero los ideales'; $chkIdeal.AutoSize = $true; $chkIdeal.ForeColor = $C.Text
 $chkIdeal.Checked = [bool]$settings.PreferIdeal; $chkIdeal.Margin = New-Object Windows.Forms.Padding(16, 5, 0, 0)
-(New-Object Windows.Forms.ToolTip).SetToolTip($chkIdeal, "Ordena poniendo primero los que tienen poco ping y justo los lugares que necesitan`n(al entrar ustedes se llena la partida). Los 'seguros' siguen pesando: un 'depende' baja en la lista.")
+(New-Object Windows.Forms.ToolTip).SetToolTip($chkIdeal, "(Experimental) Ordena poniendo primero los que tienen poco ping y justo los lugares que necesitan`n(al entrar ustedes se llena la partida). Los 'seguros' siguen pesando: un 'depende' baja en la lista.")
 $lblPing = New-FieldLabel 'Ping máximo'
 $lblPing.Margin = New-Object Windows.Forms.Padding(0, 6, 6, 0)
-$filters.Controls.AddRange(@($lblPing, $numPing, (New-FieldLabel 'ms'), $chkBig, $chkFriendsOnly, $chkMutation, $chkIdeal))
+$filters.Controls.AddRange(@($lblPing, $numPing, (New-FieldLabel 'ms'), $chkBig, $chkFriendsOnly, $chkMutation))
 
 # Campaña y tipo de server (filtran la ultima busqueda al instante)
 $modeBar = New-Row 40
@@ -700,7 +707,9 @@ $lblMode = New-FieldLabel 'Modo'
 $lblMode.Margin = New-Object Windows.Forms.Padding(24, 6, 6, 0)
 $lblHost = New-FieldLabel 'Server'
 $lblHost.Margin = New-Object Windows.Forms.Padding(24, 6, 6, 0)
-$modeBar.Controls.AddRange(@((New-FieldLabel 'Campañas'), $btnCamp, $lblMode, $pickMode.Button, $lblHost, $pickHost.Button))
+# "Primero los ideales" va en esta fila (y no en la del ping) porque sirve en las dos pestañas
+$chkIdeal.Margin = New-Object Windows.Forms.Padding(24, 5, 0, 0)
+$modeBar.Controls.AddRange(@((New-FieldLabel 'Campañas'), $btnCamp, $lblMode, $pickMode.Button, $lblHost, $pickHost.Button, $chkIdeal))
 
 # Opciones viejas que ya no se muestran (se guardan igual en la config)
 $chkShare = New-Object Windows.Forms.CheckBox
@@ -883,6 +892,7 @@ function New-Card($r) {
     if ($r.Config) { $chips.Controls.Add((New-Chip $r.Config.ToUpper() $C.Blue $C.Bg)) }
     elseif ($r.Competitive) { $chips.Controls.Add((New-Chip 'COMPETITIVO' $C.Blue $C.Bg)) }
     if ($r.Premade) { $chips.Controls.Add((New-Chip "GRUPO ARMADO ($($r.Premade))" $C.CardHi $C.Orange)) }
+    if ($r.Idle) { $chips.Controls.Add((New-Chip 'SIN PARTIDA (ESPERAN GENTE)' $C.CardHi $C.Orange)) }
     if ($isLobby) { $chips.Controls.Add((New-Chip 'SALA DE ESPERA' $C.Blue $C.Bg)) }
     if ($isLobby -and $r.Server -eq 'listen') { $chips.Controls.Add((New-Chip 'HOST LOCAL' $C.CardHi $C.Amber)) }
     if ($r.Custom -or (-not $isLobby -and $r.Campaign -eq 'custom')) { $chips.Controls.Add((New-Chip 'MAPA CUSTOM' $C.CardHi $C.Amber)) }
@@ -930,6 +940,13 @@ function New-Card($r) {
     $copy.Font = $F.Chip
     $copy.Location = New-Object Drawing.Point(($W - 176), 80); $copy.Anchor = 'Top, Right'; $copy.Tag = $link
     $copy.add_Click({ Copy-Link $this.Tag })
+    # Oficial de Valve todavía sin verificar (búsqueda en curso): sin botones hasta saber si su partida es
+    # pública. Si resulta de solo amigos o de un server falso, la tarjeta se va al terminar la búsqueda.
+    if ($r.Pending) {
+        foreach ($btn in $join, $copy) { $btn.Enabled = $false; $btn.BackColor = $C.CardHi; $btn.ForeColor = $C.Dim }
+        $join.Text = Get-UiText 'Verificando...'
+        $tips.SetToolTip($join, 'Revisando si esta partida oficial es pública (no de solo amigos). Tarda unos segundos.')
+    }
 
     $card.Controls.AddRange(@($strip, $pic, $t, $name, $chips, $hint, $slots, $pips, $slotsSub, $ping, $join, $copy))
     Convert-CardToImage $card @($join, $copy)
@@ -1149,10 +1166,47 @@ function Show-Rows {
 function Get-IdealScore($r, [int]$party) {
     $extra = [math]::Max(0, [int]$r.Max - [int]$r.Humans - $party)
     $ping = if ($r.Kind -eq 'lobby') { if ($r.Near) { 60 } else { 200 } } else { [int]$r.Ping }
-    return $ping + 30 * $extra + 60 * [int]$r.Rank
+    return $ping + 30 * $extra + 60 * [int]$r.Rank + 150 * [int][bool]$r.Idle   # sin partida armada: casi al final
 }
 function Get-IdealOrder($rows, [int]$party) {
     return @($rows | Sort-Object { Get-IdealScore $_ $party }, Ping)
+}
+# --- lista que se va llenando mientras busca ---
+# La búsqueda manda las filas por tandas: cada tarjeta nueva se arma y se pone en su lugar según el orden.
+# Al terminar, la lista se rearma de una con los datos definitivos (tapada con la foto, sin parpadeo).
+$script:liveRows = New-Object System.Collections.ArrayList
+$script:liveCards = @{}
+$script:liveTaken = 0
+function Reset-LiveRows { $script:liveRows.Clear(); $script:liveCards = @{}; $script:liveTaken = 0 }
+function Add-LiveRows {
+    $state = $script:searchState
+    if (-not $state -or -not $state.Rows -or $state.Rows.Count -le $script:liveTaken) { return }
+    while ($script:liveTaken -lt $state.Rows.Count) { [void]$script:liveRows.Add($state.Rows[$script:liveTaken]); $script:liveTaken++ }
+    if ($script:view -ne 'servers') { return }   # se muestran al volver a la pestaña (con la próxima tanda o al terminar)
+    $sel = @(Get-SelectedCampaigns)
+    $modes = @(Get-Picked $pickMode); $hosts = @(Get-Picked $pickHost)
+    $added = 0
+    $list.SuspendLayout()
+    try {
+        foreach ($r in $script:liveRows) {
+            $show = ($sel.Count -eq 0 -or $sel -contains $r.Campaign) -and (Test-ServerType $r $modes $hosts) -and ($chkMutation.Checked -or -not $r.Mutation)
+            $old = $script:liveCards[$r.Addr]
+            if (-not $show -or ($old -and -not $old.IsDisposed)) { continue }   # (si cambiaste de pestaña, la tarjeta vieja se borró)
+            if ($added -eq 0) { Hide-Spinner }   # el avance sigue abajo, en la barra de estado
+            if (-not $script:cardsWidth) { $script:cardsWidth = Get-CardWidth }
+            $card = New-Card $r
+            $script:liveCards[$r.Addr] = $card
+            $list.Controls.Add($card)
+            $added++
+        }
+        if ($added) {
+            # Cada tarjeta a su lugar según el orden de la lista
+            $shown = @($script:liveRows | Where-Object { $script:liveCards[$_.Addr] -and -not $script:liveCards[$_.Addr].IsDisposed })
+            $ordered = if ($chkIdeal.Checked) { Get-IdealOrder $shown ([int]$numParty.Value) } else { Sort-ServerRows $shown }
+            $i = 0
+            foreach ($r in $ordered) { $list.Controls.SetChildIndex($script:liveCards[$r.Addr], $i); $i++ }
+        }
+    } finally { $list.ResumeLayout() }
 }
 function Show-RowsCore {
     $all = $script:results[$script:view]
@@ -1189,6 +1243,28 @@ function Show-RowsCore {
     $hidden = @($all | Where-Object { ($_.FriendsOnly -and -not $showFriendsOnly) -or ($_.Mutation -and -not $showMutation) }).Count
     $hiddenTxt = if ($hidden) { "  $hidden ocultos (solo amigos / mutaciones)." } else { '' }
     $status.Text = "Mostrando $($rows.Count) de $($all.Count) $what ($seguros seguros).$hiddenTxt  Última búsqueda: $($script:times[$script:view])"
+    if (-not $lobbies -and $script:serverStats -and $script:serverStats.contestaron) { $status.Text = Get-ServerFunnelText $all $rows $showFriendsOnly $showMutation $seguros }
+    $tips.SetToolTip($status, $status.Text)   # completo al pasar el mouse, por si no entra
+}
+
+# Por qué hay pocos servers: de los que contestaron, cuántos quedaron afuera y por qué (lo que más recorta primero)
+function Get-ServerFunnelText($all, $rows, [bool]$showFriendsOnly, [bool]$showMutation, [int]$seguros) {
+    $s = $script:serverStats
+    # Base: servers versus con gente (los vacíos, de otro modo/juego o con contraseña no cuentan: no hay nada que cambiar)
+    $names = [ordered]@{ ping = "a más de $($s.maxping) ms"; lugar = 'sin lugar para ustedes'; grande = 'de más de 8' }
+    $base = $all.Count + @($names.Keys | ForEach-Object { [int]$s[$_] } | Measure-Object -Sum).Sum
+    $out = @($names.Keys | Where-Object { [int]$s[$_] -gt 0 } | Sort-Object { - [int]$s[$_] } | ForEach-Object { "$([int]$s[$_]) $($names[$_])" })
+    $fo = @($all | Where-Object { $_.FriendsOnly -and -not $showFriendsOnly }).Count
+    $mu = @($all | Where-Object { $_.Mutation -and -not $showMutation -and -not ($_.FriendsOnly -and -not $showFriendsOnly) }).Count
+    $byFilter = [math]::Max(0, $all.Count - $rows.Count - $fo - $mu)
+    $hid = @()
+    if ($fo) { $hid += "$fo de solo amigos" }
+    if ($mu) { $hid += "$mu mutaciones" }
+    if ($byFilter) { $hid += "$byFilter por campaña / modo / server" }
+    $txt = "Mostrando $($rows.Count) de $base servers versus con gente ($seguros seguros)."
+    if ($out.Count) { $txt += "  Afuera: $($out -join ', ')." }
+    if ($hid.Count) { $txt += "  Ocultos: $($hid -join ', ')." }
+    return "$txt  $($script:times.servers)"
 }
 
 # Las tarjetas de la otra pestaña se guardan armadas: volver a una pestaña es instantáneo mientras no
@@ -1383,7 +1459,9 @@ $btnSearch.add_Click({
         }
 
         # La busqueda corre en otro hilo: la ventana sigue respondiendo y abajo se ve el avance
-        $script:searchState = [hashtable]::Synchronized(@{ Msg = 'Pidiendo la lista de servidores a Steam...' })
+        # Rows: las filas que la búsqueda va encontrando (la ventana las muestra a medida que llegan)
+        $script:searchState = [hashtable]::Synchronized(@{ Msg = 'Pidiendo la lista de servidores a Steam...'; Rows = [Collections.ArrayList]::Synchronized((New-Object Collections.ArrayList)); Stats = [hashtable]::Synchronized(@{}) })
+        Reset-LiveRows
         $status.Text = $script:searchState.Msg
         Start-Async 'servers' {
             param($finder, $p, $ping, $big, $valve, $state)
@@ -1394,14 +1472,22 @@ $btnSearch.add_Click({
             $src = [IO.File]::ReadAllText($finder)
             $a = $src.IndexOf('# >>> BUSQUEDA'); $b = $src.IndexOf('# <<< BUSQUEDA')
             . ([scriptblock]::Create($src.Substring($a, $b - $a)))
-            Find-Servers $p $ping $big $valve { param($m) $state.Msg = $m }
+            Find-Servers $p $ping $big $valve { param($m) $state.Msg = $m } { param($rows) foreach ($x in $rows) { [void]$state.Rows.Add($x) } } $state.Stats
         } @((Join-Path $here 'finder.ps1'), [int]$numParty.Value, [int]$numPing.Value, [bool]$chkBig.Checked, $false, $script:searchState) {
             param($res, $err)
             Stop-Searching
-            if ($err) { $status.Text = "Error: $err"; return }
+            Add-LiveRows   # las últimas que hayan llegado
+            if ($err) {
+                if ($script:view -eq 'servers') { Clear-List }
+                Reset-LiveRows
+                $status.Text = "Error: $err"; return
+            }
             $script:results.servers = @($res | ForEach-Object { $_ })
+            $script:serverStats = @{}; foreach ($k in @($script:searchState.Stats.Keys)) { $script:serverStats[$k] = $script:searchState.Stats[$k] }
             $script:times.servers = Get-Date -Format 'HH:mm'
+            # La lista definitiva reemplaza a la que se fue llenando (los oficiales ya verificados)
             if ($script:view -eq 'servers') { Show-Rows }
+            Reset-LiveRows
         }
     })
 
@@ -2644,7 +2730,7 @@ if ($Screenshot) {
             }
             # Captura extra a mitad de la busqueda (para ver el spinner)
             $mid = New-Object Windows.Forms.Timer
-            $mid.Interval = 4000
+            $mid.Interval = if ($env:L4D2_SHOT_MID) { [int]$env:L4D2_SHOT_MID } else { 4000 }   # ms (para ver la lista llenándose)
             $mid.add_Tick({
                     $this.Stop()
                     $bmp = New-Object Drawing.Bitmap($form.Width, $form.Height)

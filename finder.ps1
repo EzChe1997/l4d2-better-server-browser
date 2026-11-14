@@ -28,7 +28,7 @@ $keyFile = Join-Path $here 'apikey.txt'
 # ======================= actualizaciones automaticas =======================
 # La app se fija si hay una version nueva publicada en GitHub. El indice (update.json) va firmado
 # con una clave que solo tiene quien publica: si la firma no coincide, la actualizacion se ignora.
-$AppVersion = 8
+$AppVersion = 9
 $updateBase = 'https://raw.githubusercontent.com/EzChe1997/l4d2-better-server-browser/main'   # lo completa publicar.ps1 (https://raw.githubusercontent.com/<usuario>/<repo>/main)
 $updatePublicKey = '<RSAKeyValue><Modulus>3uVFz1ZH9ed0Zun/YcmPi4gk8EALr+R7/DYQY+Fz5NArgRYEo1iNfjNpBUn7G3R0Tliw5DjecmnM0/InLrFLJl2BgMmwJo0VBw4BJ/7qmQm1q7oJoZ0mjI8cgxynbgyhARnQY3i9lVnEGfwB3IOnYhire7XM6iFxui9b5fOd3npzorhJakLqdMdPLBc7BT5VE8E/MfeyhlhusGlKpgsB4QWY3U8WufkkE81E5bziCI1m3RYYUVeoqGukzfujshi2OwV9EBpAIWgDmdZNA3UBDwd6Q0ocq2/EvPfzzNZgNbeQObT+DutokxYEz2e8DlZU0ek46JsxTOFQShlNKoOeHUiXMfjfwUc3j6KqYRNUF1VV9xOzML2W9/+l73r6SnmrPVMItghOEzVivQgZ6gtk3Y901stV4yxTB+RFXO89EFbGYF4C2zhGvdssKxuWibjan9P5D6f/00E6uAb4ehy5MT5Cfj7Iy0Wqo8AmKTOFWOJU8BOjDOu7Odbgi8Xs6dNp</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>'
 $updateFiles = @('finder.ps1', 'ui.ps1', 'vpk.ps1', 'lobbies.ps1', 'Buscar versus.bat')
@@ -230,7 +230,7 @@ function ConvertFrom-RulesCfg([byte[]]$d, [string]$rule = 'l4d_ready_cfg_name') 
         if ($name -eq $rule) { return [Text.Encoding]::UTF8.GetString($d, $p, $e - $p) }
         $p = $e + 1
     }
-    return ''
+    return '#none'   # el server no publica la variable (distinto de publicarla vacía = sin partida cargada)
 }
 
 function Invoke-RulesScan([string[]]$addrs, [int]$waitMs = 2000, [string]$rule = 'l4d_ready_cfg_name') {
@@ -255,7 +255,7 @@ function Invoke-RulesScan([string[]]$addrs, [int]$waitMs = 2000, [string]$rule =
                 } elseif ($d[4] -eq 0x45) { $results[$k] = ConvertFrom-RulesCfg $d $rule }
             } elseif ($head -eq -2 -and $d.Length -gt 12) {
                 # Respuesta partida en varios paquetes: FE FF FF FF, id, total, numero, tamano, datos
-                if ([BitConverter]::ToInt32($d, 4) -lt 0) { $results[$k] = ''; continue }   # comprimida: no soportada
+                if ([BitConverter]::ToInt32($d, 4) -lt 0) { $results[$k] = '#none'; continue }   # comprimida: no soportada
                 $total = [int]$d[8]
                 if (-not $parts.ContainsKey($k)) { $parts[$k] = @{} }
                 $chunk = New-Object byte[] ($d.Length - 12)
@@ -265,7 +265,7 @@ function Invoke-RulesScan([string[]]$addrs, [int]$waitMs = 2000, [string]$rule =
                     $ms = New-Object IO.MemoryStream
                     for ($n = 0; $n -lt $total; $n++) { $b = $parts[$k][$n]; if ($b) { $ms.Write($b, 0, $b.Length) } }
                     $all = $ms.ToArray()
-                    $results[$k] = if ($all.Length -gt 7 -and $all[4] -eq 0x45) { ConvertFrom-RulesCfg $all $rule } else { '' }
+                    $results[$k] = if ($all.Length -gt 7 -and $all[4] -eq 0x45) { ConvertFrom-RulesCfg $all $rule } else { '#none' }
                 }
             }
         }
@@ -588,74 +588,196 @@ function Get-SteamServerList([string]$dir) {
     return @(($json | ConvertFrom-Json) | ForEach-Object { $_ } | Where-Object { $_ })
 }
 
-function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValve, [scriptblock]$OnStatus) {
-    & $OnStatus 'Pidiendo la lista de servidores a Steam...'
-    # 1) Al cliente de Steam (sin key). 2) Si falla y hay API key, a la Web API como antes.
-    $srvList = $null; $clientError = $null
-    try { $srvList = @(Get-SteamServerList $here | ForEach-Object { [pscustomobject]@{ addr = $_; gametype = 'versus'; name = ''; players = 0; max_players = 0 } }) }
-    catch { $clientError = $_.Exception.Message }
-    if ($null -eq $srvList) {
-        if (-not (Test-Path $keyFile)) { throw "No pude pedirle la lista de servidores a Steam: $clientError" }
-        $key = (Get-Content $keyFile -Raw).Trim()
-        $filter = '\appid\550\empty\1\notfull\1'
-        $url = "https://api.steampowered.com/IGameServersService/GetServerList/v1/?key=$key&limit=5000&filter=" + [uri]::EscapeDataString($filter)
-        $srvList = @((Invoke-RestMethod -Uri $url -TimeoutSec 20).response.servers)
+# Fila de la lista para un server ($null si no sirve). $offPending: todavía no se sabe qué oficiales tienen
+# sala pública; los de Valve salen "en verificación" (sin poder unirse) hasta saberlo.
+function ConvertTo-ServerRow($s, $pl, $rules, $offMatch, [bool]$offPending, $hist, [int]$p, [bool]$includeBig) {
+    $isValve = $s.Name -like 'Valve Left4Dead 2*'
+    $mutation = Test-MutationServer "$($s.Tags)" "$($s.Name)"
+    # Se hace pasar por oficial sin ser de Valve: server con mods (p. ej. Lewd4Dead). Se oculta como las mutaciones.
+    if (",$($s.Tags)," -match ',official,' -and -not $isValve) { $mutation = $true }
+    $friendsOnly = $false; $pending = $false
+    if ($isValve -and $offPending) { $pending = $true }
+    elseif ($isValve -and $null -ne $offMatch) {
+        if (-not $offMatch.ContainsKey($s.Addr)) { $friendsOnly = $true }
+        elseif ($offMatch[$s.Addr].Mode -ne 'versus') { $mutation = $true }
     }
+    # Oficial con sala publica: se entra por la SALA, no conectando al server. Asi siempre es una partida
+    # publica (el cruce sala<->server es aproximado, y conectar directo a un server ajeno te mete en
+    # cualquier partida, aunque sea privada o de solo amigos).
+    $lobbyLink = ''
+    if ($isValve -and $null -ne $offMatch -and $offMatch.ContainsKey($s.Addr)) { $lobbyLink = "steam://joinlobby/550/$($offMatch[$s.Addr].Lobby)" }
 
-    # (La lista del cliente ya viene filtrada por Steam y sin datos: los filtros de verdad van despues del ping)
-    $pre = @($srvList | Where-Object {
-            (Test-VersusServer "$($_.gametype)" "$($_.name)") -and
-            ($_.max_players -eq 0 -or (
-                ($_.max_players - $_.players) -ge $p -and
-                # Los competitivos declaran 14-30 lugares para espectadores: el tamano real se mira despues
-                ($includeBig -or $_.max_players -le 8 -or $_.gametype -match 'confogl'))) -and
-            -not ($hideValve -and $_.name -like 'Valve Left4Dead 2*')
-        })
-    # Sumar el historial de Steam (lo que no este ya en la lista publica)
-    $listed = New-Object 'System.Collections.Generic.HashSet[string]'
-    foreach ($s in $srvList) { [void]$listed.Add([string]$s.addr) }
-    $hist = New-Object 'System.Collections.Generic.HashSet[string]'
-    foreach ($a in (Get-HistoryServers)) { if (-not $listed.Contains($a)) { [void]$hist.Add($a) } }
-    $addrs = @($pre | ForEach-Object { $_.addr }) + @($hist)
-    # Mientras se mide el ping, pedirle a Steam las salas publicas de partidas en servers oficiales
+    # Config competitiva: la variable del server; si no la publica, el nombre del server.
+    $rawCfg = if ($rules.ContainsKey($s.Addr)) { "$($rules[$s.Addr])" } else { '#none' }
+    $cfg = if ($rawCfg.StartsWith('#')) { '' } else { $rawCfg }
+    # Competitivo con la variable publicada pero vacía: no hay partida armada. La gente que está ahí espera
+    # juntar 8 (servers "pug"); suelen irse, y muchos reinician el mapa a los segundos de quedar vacíos
+    # (sm_restart_empty). Por eso se puede entrar viendo 1-2 nombres y encontrarse solo.
+    $idle = ($s.Tags -match 'confogl') -and ($rawCfg -eq '' -or $rawCfg -eq '#empty')
+    $text = "$cfg $($s.Name)"
+    $competitive = $s.Tags -match 'confogl'
+    $zoneMod = $text -match 'zone\s*mod|zonepug'
+    # Formato de equipos si lo dice (1v1, 3v3, 4vs4, 10x10...)
+    $team = 0
+    if ($text -match '(?<!\d)(\d{1,2})\s*(?:vs|v|x)\s*\1(?!\d)') { $team = [int]$Matches[1] }
+    # Competitivo sin formato declarado: 4v4 (el resto de los lugares son para espectadores)
+    if ($competitive -and $team -eq 0) { $team = 4 }
+    $effMax = if ($team -gt 0) { [math]::Min($s.MaxPlayers, 2 * $team) } else { $s.MaxPlayers }
+    if (-not $includeBig -and $effMax -gt 8) { return $null }
+
+    $v = Get-Verdict $s $pl $p $team
+    if (-not $v) { return $null }
+    $h = [math]::Max($s.Players, @($pl).Count)
+    # Grupo armado: 3 o 4 que entraron juntos (tamano de un equipo). 5+ juntos suele ser
+    # una partida que arranco entera desde un lobby, eso no lo marcamos.
+    $groups = Get-JoinGroups $pl
+    $teamSize = if ($team -gt 0) { $team } else { [math]::Floor($s.MaxPlayers / 2) }
+    $premade = if ($groups.Count -gt 0 -and $groups[0] -ge 3 -and $groups[0] -le $teamSize) { [int]$groups[0] } else { 0 }
+    $hint = $v.Hint
+    if ($premade) { $hint += " | grupo armado de $premade" }
+    if ($idle) { $hint += ' | sin partida armada: esperan juntar gente (si se van, el server se reinicia)' }
+    if ($friendsOnly) { $hint += ' | sin sala pública: probablemente de solo amigos' }
+    if ($mutation) { $hint += ' | mutación u otro modo' }
+    if ($effMax -gt 8) { $hint += " | server grande ($effMax)" }
+    if ($hist.Contains($s.Addr)) { $hint += ' | de tu historial de Steam' }
+    return [pscustomobject]@{
+        Rank = $v.Rank; Estado = $v.Status; Ping = $s.Ping
+        Jugadores = "$h/$effMax"; Nombre = $s.Name; Mapa = $s.Map
+        Pista = $hint; Addr = $s.Addr
+        Hint = $v.Hint; Valve = $isValve; Max = $effMax; Humans = $h
+        Premade = $premade; FriendsOnly = $friendsOnly; Mutation = $mutation; Link = $lobbyLink
+        Campaign = (Get-CampaignKey $s.Map); Config = $cfg; Competitive = $competitive; ZoneMod = $zoneMod; Team = $team; Idle = $idle
+        Pending = $pending
+    }
+}
+
+# Orden de la lista: seguros primero; dentro de cada grupo, los sin partida armada al final, después los
+# grupos armados, y por ping
+function Sort-ServerRows($rows) { return @($rows | Sort-Object Rank, { [int]$_.Idle }, { [int]($_.Premade -gt 0) }, Ping) }
+
+# Busca servers versus con lugar. Va por tandas a medida que Steam da la lista: cada tanda se mide (ping),
+# se miran sus jugadores y su config, y sus filas salen enseguida por $OnRows (la ventana las va mostrando).
+# Al final se cruzan los oficiales con sus salas públicas y se devuelve la lista completa y definitiva.
+# $Stats (opcional): se llena con cuántos servers hubo y por qué quedó afuera cada uno
+function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValve, [scriptblock]$OnStatus, [scriptblock]$OnRows, [hashtable]$Stats) {
+    $stats = if ($null -ne $Stats) { $Stats } else { @{} }
+    & $OnStatus 'Pidiendo la lista de servidores a Steam...'
+    # Lo que más tarda (salas de los oficiales y servers que se hacen pasar por oficiales) arranca ya, en paralelo
     $offHelper = $null; $fakeHelper = $null
     try { $offHelper = Start-OfficialGamesHelper $here } catch {}
-    # Y la lista de servers que se hacen pasar por oficiales (ver Get-OfficialLobbyMatch)
     try { $fakeHelper = Start-LobbyHelper $here '-Servers -ServerFilter "gamedir=left4dead2,gametagsand=official"' } catch {}
-    & $OnStatus "Midiendo ping de $($addrs.Count) servers versus con lugar..."
     # Espera por tanda segun el ping maximo: hacen falta 2 idas y vueltas (desafio + respuesta).
     # Lo que conteste mas tarde igual quedaria afuera por ping.
     $wait = [math]::Min(900, 2 * $maxPing + 250)
-    $infos = @(Invoke-InfoScan $addrs 40 $wait)
-    # Reintento con mas espera para los que no contestaron (paquetes perdidos o servers lentos)
+    $offPending = [bool]$offHelper
+
+    $listed = New-Object 'System.Collections.Generic.HashSet[string]'
     $answered = New-Object 'System.Collections.Generic.HashSet[string]'
-    foreach ($i in $infos) { [void]$answered.Add($i.Addr) }
-    $retry = @($addrs | Where-Object { -not $answered.Contains($_) })
-    if ($retry.Count) {
-        & $OnStatus "Reintentando $($retry.Count) servers que no contestaron..."
-        $infos += @(Invoke-InfoScan $retry 40 ([math]::Min(1500, 2 * $wait)))
-    }
-    $near = @($infos | Where-Object {
-            $_.Ping -le $maxPing -and $_.Password -eq 0 -and (Test-VersusServer "$($_.Tags)" "$($_.Name)") -and $_.Players -gt 0 -and
-            (-not $hist.Contains($_.Addr) -or $_.AppId -eq 550) -and
-            ($_.MaxPlayers - $_.Players) -ge $p -and ($includeBig -or $_.MaxPlayers -le 8 -or $_.Tags -match 'confogl')
-        })
-    & $OnStatus "Revisando jugadores de $($near.Count) servers cercanos..."
-    $players = Invoke-PlayerScan @($near | ForEach-Object { $_.Addr })
-    $competitiveAddrs = @($near | Where-Object { $_.Tags -match 'confogl' } | ForEach-Object { $_.Addr })
-    $rules = @{}
-    if ($competitiveAddrs.Count) {
-        & $OnStatus "Leyendo la config de $($competitiveAddrs.Count) servers competitivos..."
-        $rules = Invoke-RulesScan $competitiveAddrs
+    $hist = New-Object 'System.Collections.Generic.HashSet[string]'
+    $allInfos = New-Object System.Collections.ArrayList
+    $near = New-Object System.Collections.ArrayList
+    $players = @{}; $rules = @{}
+    $queue = New-Object 'System.Collections.Generic.List[string]'
+
+    # Una tanda: ping + datos; las cercanas con lugar, jugadores y config; y sus filas a la ventana
+    $doChunk = {
+        param([string[]]$addrs, [int]$waitMs)
+        $infos = @(Invoke-InfoScan $addrs 40 $waitMs)
+        foreach ($i in $infos) { [void]$answered.Add($i.Addr); [void]$allInfos.Add($i) }
+        # Cada server que queda afuera se cuenta por su motivo (la ventana explica por qué hay pocos)
+        $nearNow = @(foreach ($i in $infos) {
+                $why = if ($hist.Contains($i.Addr) -and $i.AppId -ne 550) { 'otro' }
+                elseif (-not (Test-VersusServer "$($i.Tags)" "$($i.Name)")) { 'otro' }
+                elseif ($i.Password -ne 0) { 'clave' }
+                elseif ($i.Players -le 0) { 'vacio' }
+                elseif ($i.Ping -gt $maxPing) { 'ping' }
+                elseif (($i.MaxPlayers - $i.Players) -lt $p) { 'lugar' }
+                elseif (-not ($includeBig -or $i.MaxPlayers -le 8 -or $i.Tags -match 'confogl')) { 'grande' }
+                else { '' }
+                if ($why) { $stats[$why] = 1 + [int]$stats[$why] } else { $i }
+            })
+        if (-not $nearNow.Count) { return }
+        $pl = Invoke-PlayerScan @($nearNow | ForEach-Object { $_.Addr }) ([math]::Max(700, $waitMs))
+        foreach ($k in $pl.Keys) { $players[$k] = $pl[$k] }
+        $comp = @($nearNow | Where-Object { $_.Tags -match 'confogl' } | ForEach-Object { $_.Addr })
+        if ($comp.Count) { $r = Invoke-RulesScan $comp 1500; foreach ($k in $r.Keys) { $rules[$k] = $r[$k] } }
+        $rowsNow = @(foreach ($s in $nearNow) {
+                [void]$near.Add($s)
+                $plS = if ($players.ContainsKey($s.Addr)) { $players[$s.Addr] } else { @() }
+                $row = ConvertTo-ServerRow $s $plS $rules $null $offPending $hist $p $includeBig
+                if ($row) { $row } else { $stats['lugar'] = 1 + [int]$stats['lugar'] }   # sin lugar en un equipo (o grande por su formato)
+            })
+        if ($OnRows -and @($rowsNow).Count) { & $OnRows @($rowsNow) }
     }
 
-    # Oficiales de Valve: cual tiene sala publica (y de que modo). Si Steam no contesta, no se marca nada.
+    # 1) Lista del cliente de Steam (sin key), una dirección por línea apenas llega: se mide mientras tanto
+    $clientError = $null
+    $sh = $null
+    try { $sh = Start-LobbyHelper $here '-Servers -StreamList' -Stream } catch { $clientError = $_.Exception.Message }
+    if ($sh) {
+        $reader = $sh.Proc.StandardOutput
+        $task = $reader.ReadLineAsync()
+        $ended = $false
+        $deadline = (Get-Date).AddSeconds(25)
+        while ($true) {
+            while (-not $ended -and $task.IsCompleted) {
+                $line = $task.Result
+                if ($null -eq $line -or $line -eq 'END') { $ended = $true; break }
+                if ($line -like 'ERROR:*') { $clientError = $line.Substring(6).Trim(); $ended = $true; break }
+                if ($line -match '^\d{1,3}(\.\d{1,3}){3}:\d+$' -and $listed.Add($line)) { $queue.Add($line) }
+                $task = $reader.ReadLineAsync()
+            }
+            if ($queue.Count -ge 40 -or ($ended -and $queue.Count)) {
+                $n = [math]::Min(40, $queue.Count)
+                $chunk = $queue.GetRange(0, $n).ToArray(); $queue.RemoveRange(0, $n)
+                & $OnStatus "Midiendo ping de servers versus con lugar... ($($answered.Count) contestaron de $($listed.Count))"
+                & $doChunk $chunk $wait
+                continue
+            }
+            if ($ended) { break }
+            if ((Get-Date) -gt $deadline) { $clientError = 'Steam tardó demasiado en dar la lista de servidores.'; break }
+            Start-Sleep -Milliseconds 30
+        }
+        try { if (-not $sh.Proc.HasExited) { $sh.Proc.Kill() } } catch {}
+    }
+
+    # 2) Si el cliente no dio nada y hay API key, la Web API como antes
+    if ($listed.Count -eq 0) {
+        if (-not (Test-Path $keyFile)) { throw "No pude pedirle la lista de servidores a Steam: $clientError" }
+        $key = (Get-Content $keyFile -Raw).Trim()
+        $url = "https://api.steampowered.com/IGameServersService/GetServerList/v1/?key=$key&limit=5000&filter=" + [uri]::EscapeDataString('\appid\550\empty\1\notfull\1')
+        $srvList = @((Invoke-RestMethod -Uri $url -TimeoutSec 20).response.servers)
+        foreach ($s in $srvList) { [void]$listed.Add([string]$s.addr) }
+        $pre = @($srvList | Where-Object {
+                (Test-VersusServer "$($_.gametype)" "$($_.name)") -and ($_.max_players - $_.players) -ge $p -and
+                # Los competitivos declaran 14-30 lugares para espectadores: el tamano real se mira despues
+                ($includeBig -or $_.max_players -le 8 -or $_.gametype -match 'confogl') -and
+                -not ($hideValve -and $_.name -like 'Valve Left4Dead 2*')
+            } | ForEach-Object { [string]$_.addr })
+        for ($i = 0; $i -lt $pre.Count; $i += 40) {
+            & $OnStatus "Midiendo ping de $($pre.Count) servers versus con lugar..."
+            & $doChunk @($pre[$i..([math]::Min($i + 40, $pre.Count) - 1)]) $wait
+        }
+    }
+
+    # 3) Historial y favoritos de Steam (lo que no estaba en la lista pública)
+    foreach ($a in (Get-HistoryServers)) { if (-not $listed.Contains($a)) { [void]$hist.Add($a) } }
+    if ($hist.Count) { & $doChunk @($hist) $wait }
+
+    # 4) Reintento con mas espera para los que no contestaron (paquetes perdidos o servers lentos)
+    $retry = @(@($listed) + @($hist) | Where-Object { -not $answered.Contains($_) })
+    if ($retry.Count) {
+        & $OnStatus "Reintentando $($retry.Count) servers que no contestaron..."
+        & $doChunk $retry ([math]::Min(1500, 2 * $wait))
+    }
+
+    # 5) Oficiales de Valve: cual tiene sala publica (y de que modo). Si Steam no contesta, no se marca nada.
     $offMatch = $null
     if ($offHelper) {
         & $OnStatus 'Revisando cuáles partidas oficiales son públicas...'
         # Servers falsos "oficiales" con gente: los de la lista de Steam + los que ya contestaron en esta búsqueda
         $fakes = @{}
-        foreach ($i in $infos) { if (",$($i.Tags)," -match ',official,' -and $i.Name -notlike 'Valve Left4Dead 2*') { $fakes[$i.Addr] = $i } }
+        foreach ($i in $allInfos) { if (",$($i.Tags)," -match ',official,' -and $i.Name -notlike 'Valve Left4Dead 2*') { $fakes[$i.Addr] = $i } }
         if ($fakeHelper) {
             try {
                 $fakeAddrs = @(((Receive-LobbyHelper $fakeHelper) | ConvertFrom-Json) | ForEach-Object { [string]$_ } | Where-Object { $_ -and -not $fakes.ContainsKey($_) })
@@ -671,61 +793,15 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
         } catch { $offMatch = $null }
     } elseif ($fakeHelper) { try { $fakeHelper.Proc.Kill() } catch {} }
 
+    # 6) Lista definitiva (los oficiales ya con su sala, o marcados como de solo amigos)
     $rows = foreach ($s in $near) {
         $pl = if ($players.ContainsKey($s.Addr)) { $players[$s.Addr] } else { @() }
-        $isValve = $s.Name -like 'Valve Left4Dead 2*'
-        $mutation = Test-MutationServer "$($s.Tags)" "$($s.Name)"
-        # Se hace pasar por oficial sin ser de Valve: server con mods (p. ej. Lewd4Dead). Se oculta como las mutaciones.
-        if (",$($s.Tags)," -match ',official,' -and -not ($s.Name -like 'Valve Left4Dead 2*')) { $mutation = $true }
-        $friendsOnly = $false
-        if ($isValve -and $null -ne $offMatch) {
-            if (-not $offMatch.ContainsKey($s.Addr)) { $friendsOnly = $true }
-            elseif ($offMatch[$s.Addr].Mode -ne 'versus') { $mutation = $true }
-        }
-        # Oficial con sala publica: se entra por la SALA, no conectando al server. Asi siempre es una partida
-        # publica (el cruce sala<->server es aproximado, y conectar directo a un server ajeno te mete en
-        # cualquier partida, aunque sea privada o de solo amigos).
-        $lobbyLink = ''
-        if ($isValve -and $null -ne $offMatch -and $offMatch.ContainsKey($s.Addr)) { $lobbyLink = "steam://joinlobby/550/$($offMatch[$s.Addr].Lobby)" }
-
-        # Config competitiva: la variable del server; si no la publica, el nombre del server.
-        $cfg = if ($rules.ContainsKey($s.Addr)) { "$($rules[$s.Addr])" } else { '' }
-        if ($cfg -eq '#empty') { $cfg = '' }
-        $text = "$cfg $($s.Name)"
-        $competitive = $s.Tags -match 'confogl'
-        $zoneMod = $text -match 'zone\s*mod|zonepug'
-        # Formato de equipos si lo dice (1v1, 3v3, 4vs4, 10x10...)
-        $team = 0
-        if ($text -match '(?<!\d)(\d{1,2})\s*(?:vs|v|x)\s*\1(?!\d)') { $team = [int]$Matches[1] }
-        # Competitivo sin formato declarado: 4v4 (el resto de los lugares son para espectadores)
-        if ($competitive -and $team -eq 0) { $team = 4 }
-        $effMax = if ($team -gt 0) { [math]::Min($s.MaxPlayers, 2 * $team) } else { $s.MaxPlayers }
-        if (-not $includeBig -and $effMax -gt 8) { continue }
-
-        $v = Get-Verdict $s $pl $p $team
-        if (-not $v) { continue }
-        $h = [math]::Max($s.Players, @($pl).Count)
-        # Grupo armado: 3 o 4 que entraron juntos (tamano de un equipo). 5+ juntos suele ser
-        # una partida que arranco entera desde un lobby, eso no lo marcamos.
-        $groups = Get-JoinGroups $pl
-        $teamSize = if ($team -gt 0) { $team } else { [math]::Floor($s.MaxPlayers / 2) }
-        $premade = if ($groups.Count -gt 0 -and $groups[0] -ge 3 -and $groups[0] -le $teamSize) { [int]$groups[0] } else { 0 }
-        $hint = $v.Hint
-        if ($premade) { $hint += " | grupo armado de $premade" }
-        if ($friendsOnly) { $hint += ' | sin sala pública: probablemente de solo amigos' }
-        if ($mutation) { $hint += ' | mutación u otro modo' }
-        if ($effMax -gt 8) { $hint += " | server grande ($effMax)" }
-        if ($hist.Contains($s.Addr)) { $hint += ' | de tu historial de Steam' }
-        [pscustomobject]@{
-            Rank = $v.Rank; Estado = $v.Status; Ping = $s.Ping
-            Jugadores = "$h/$effMax"; Nombre = $s.Name; Mapa = $s.Map
-            Pista = $hint; Addr = $s.Addr
-            Hint = $v.Hint; Valve = ($s.Name -like 'Valve Left4Dead 2*'); Max = $effMax; Humans = $h
-            Premade = $premade; FriendsOnly = $friendsOnly; Mutation = $mutation; Link = $lobbyLink
-            Campaign = (Get-CampaignKey $s.Map); Config = $cfg; Competitive = $competitive; ZoneMod = $zoneMod; Team = $team
-        }
+        ConvertTo-ServerRow $s $pl $rules $offMatch $false $hist $p $includeBig
     }
-    $rows = @($rows | Sort-Object Rank, { [int]($_.Premade -gt 0) }, Ping)
+    $rows = Sort-ServerRows @($rows | Where-Object { $_ })
+    $stats['listados'] = $listed.Count + $hist.Count
+    $stats['contestaron'] = $answered.Count
+    $stats['maxping'] = $maxPing
     & $OnStatus ("Listo: {0} servers ({1} seguros). {2:HH:mm}" -f $rows.Count, @($rows | Where-Object { $_.Rank -eq 0 }).Count, (Get-Date))
     return $rows
 }

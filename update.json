@@ -1,12 +1,12 @@
 {
-    "version":  8,
-    "notes":  "Una sola app abierta (arregla el sonido), entra solo cuando se libera lugar en el server del lider, filtra servers falsos \u0027oficiales\u0027 (Lewd4Dead), opcion \u0027Primero los ideales\u0027 y la busqueda ya no queda trabada",
-    "date":  "2026-11-14 10:07",
+    "version":  9,
+    "notes":  "La lista se llena mientras busca, explica por que quedaron pocos servers, marca los ZoneMod sin partida armada, \u0027Primero los ideales\u0027 tambien en salas de espera y el icono al anclar a Inicio",
+    "date":  "2026-11-14 10:57",
     "files":  {
-                  "finder.ps1":  "917d1cb1f2f7e69727014975f973a07b75996cd1078af370d9d5f4dbd0b8000a",
-                  "ui.ps1":  "de2cc80709c30ec1a8d570146c80b8b711d3fe33840cc20455242bfd3518f192",
+                  "finder.ps1":  "dba10d42fbee71445d2b61479ceafa9d49b647c1abdb994cc4f8caf255ebd474",
+                  "ui.ps1":  "d4baf50524414671b4ea1d6057a27463c31f24f94164f80992a9fb29f4623694",
                   "vpk.ps1":  "a33358afe20ca8d31901f90d36340322c476b68899215d26a9ee91daad9d40c5",
-                  "lobbies.ps1":  "66c8f07df1ceb98141def164e157a461f14fe88b4e13b571ca205ceb490d6125",
+                  "lobbies.ps1":  "87c176a6b7940199634395f8cfa73f1493b3e3a4f7a4efdc21f01cb74d2acfa6",
                   "Buscar versus.bat":  "608546897db095fcb0bc007ee31048185cddc1d8862f04cc2a74e0318628fcb6"
               }
 }
