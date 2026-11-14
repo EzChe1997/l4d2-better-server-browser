@@ -1,10 +1,10 @@
 {
-    "version":  7,
-    "notes":  "Nueva sección Dónde está tu grupo (server/sala de cada uno en tiempo real) y Unirme trae el juego al frente",
-    "date":  "2026-11-13 19:35",
+    "version":  8,
+    "notes":  "Una sola app abierta (arregla el sonido), entra solo cuando se libera lugar en el server del lider, filtra servers falsos \u0027oficiales\u0027 (Lewd4Dead), opcion \u0027Primero los ideales\u0027 y la busqueda ya no queda trabada",
+    "date":  "2026-11-14 10:07",
     "files":  {
-                  "finder.ps1":  "aa3d8a66f7a34caee3313adb1ad4968084544d71c58f40368eecf8d7751dfb2b",
-                  "ui.ps1":  "18e84b086933739d06bd007e79515ba854018d0516867ac3467173a7a9677d05",
+                  "finder.ps1":  "917d1cb1f2f7e69727014975f973a07b75996cd1078af370d9d5f4dbd0b8000a",
+                  "ui.ps1":  "de2cc80709c30ec1a8d570146c80b8b711d3fe33840cc20455242bfd3518f192",
                   "vpk.ps1":  "a33358afe20ca8d31901f90d36340322c476b68899215d26a9ee91daad9d40c5",
                   "lobbies.ps1":  "66c8f07df1ceb98141def164e157a461f14fe88b4e13b571ca205ceb490d6125",
                   "Buscar versus.bat":  "608546897db095fcb0bc007ee31048185cddc1d8862f04cc2a74e0318628fcb6"

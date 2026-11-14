@@ -6,6 +6,30 @@ try {
     Add-Type -Name AppId -Namespace L4dShell -MemberDefinition '[DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern int SetCurrentProcessExplicitAppUserModelID(string id);'
     [void][L4dShell.AppId]::SetCurrentProcessExplicitAppUserModelID('L4D2.BuscadorDeVersus')
 } catch {}
+# Una sola app abierta por PC. Con dos abiertas, cada una avisaba algo distinto al grupo y se pisaban (el
+# grupo "parpadeaba" cada 9 min y sonaba en todas las apps), y las dos le mandaban órdenes al juego.
+# Si ya hay una abierta, se la trae adelante y esta se cierra. Al reiniciar por una actualización, la
+# nueva espera a que la vieja termine de cerrarse.
+if (-not $Screenshot -and -not $env:L4D2_TEST_NOGROUP) {
+    $script:instanceMutex = New-Object Threading.Mutex($false, 'Local\L4D2.BuscadorDeVersus')
+    $owned = $false
+    $waitMs = if ($env:L4D2_RESTART) { 20000 } else { 0 }
+    Remove-Item Env:\L4D2_RESTART -ErrorAction SilentlyContinue
+    try { $owned = $script:instanceMutex.WaitOne($waitMs) } catch [Threading.AbandonedMutexException] { $owned = $true }
+    if (-not $owned) {
+        try {
+            Add-Type -Name Front -Namespace L4dShell -MemberDefinition ('[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);' +
+                '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);' +
+                '[DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);')
+            $other = Get-Process powershell -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID -and $_.MainWindowTitle -like 'Buscador de versus*' } | Select-Object -First 1
+            if ($other) {
+                if ([L4dShell.Front]::IsIconic($other.MainWindowHandle)) { [void][L4dShell.Front]::ShowWindow($other.MainWindowHandle, 9) }
+                [void][L4dShell.Front]::SetForegroundWindow($other.MainWindowHandle)
+            }
+        } catch {}
+        [Environment]::Exit(0)
+    }
+}
 if (-not ('L4dShell.Redraw' -as [type])) {
     Add-Type -Name Redraw -Namespace L4dShell -MemberDefinition ('[DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);' +
         '[DllImport("user32.dll")] public static extern bool RedrawWindow(IntPtr h, IntPtr rect, IntPtr rgn, uint flags);' +
@@ -151,7 +175,7 @@ function Start-Async([string]$name, [scriptblock]$work, [object[]]$argv, [script
     [void]$ps.AddScript($work.ToString())
     foreach ($a in $argv) { [void]$ps.AddArgument($a) }
     $script:busy[$name] = $true
-    [void]$script:jobs.Add(@{ Name = $name; PS = $ps; H = $ps.BeginInvoke(); Done = $done })
+    [void]$script:jobs.Add(@{ Name = $name; PS = $ps; H = $ps.BeginInvoke(); Done = $done; Started = Get-Date })
     $pumpTimer.Start()   # solo corre mientras haya algo en segundo plano
 }
 
@@ -167,9 +191,24 @@ $pumpTimer.Interval = 150
 $script:searchState = $null
 $pumpTimer.add_Tick({
         if ($script:busy['servers'] -and $script:searchState -and $status.Text -ne $script:searchState.Msg) { $status.Text = $script:searchState.Msg }
+        if ($script:busy['servers'] -and $script:searchState -and $script:searchState.Msg -ne $script:searchLogged) {
+            $script:searchLogged = $script:searchState.Msg
+            Write-AppLog "Búsqueda: $($script:searchLogged)"
+        }
         for ($i = $script:jobs.Count - 1; $i -ge 0; $i--) {
             $j = $script:jobs[$i]
-            if (-not $j.H.IsCompleted) { continue }
+            if (-not $j.H.IsCompleted) {
+                # Una búsqueda que no termina en 2 min se da por trabada: se corta y se avisa en qué paso quedó
+                # (antes la ruedita quedaba girando para siempre)
+                if ($j.Name -in 'servers', 'lobbies' -and ((Get-Date) - $j.Started).TotalSeconds -gt 120) {
+                    $script:jobs.RemoveAt($i); $script:busy[$j.Name] = $false
+                    $step = if ($j.Name -eq 'servers' -and $script:searchState) { $script:searchState.Msg } else { '' }
+                    Write-AppLog "Búsqueda [$($j.Name)] trabada más de 2 min (paso: '$step'): la corto."
+                    try { [void]$j.PS.BeginStop($null, $null) } catch {}
+                    try { & $j.Done $null "La búsqueda se trabó ($step). Probá de nuevo; si sigue pasando, mandame eventos.log." } catch {}
+                }
+                continue
+            }
             $script:jobs.RemoveAt($i)
             $script:busy[$j.Name] = $false
             $res = $null; $err = $null
@@ -180,7 +219,8 @@ $pumpTimer.add_Tick({
                 $e = $_.Exception; while ($e.InnerException) { $e = $e.InnerException }
                 $err = $e.Message
             } finally { $j.PS.Dispose() }
-            if ($err -and $j.Name -ne 'servers') { Write-AppLog "Error en segundo plano [$($j.Name)]: $err" }
+            if ($err) { Write-AppLog "Error en segundo plano [$($j.Name)]: $err" }
+            if ($j.Name -in 'servers', 'lobbies') { Write-AppLog ("Búsqueda [{0}] terminó en {1:N0} s: {2}" -f $j.Name, ((Get-Date) - $j.Started).TotalSeconds, $(if ($err) { 'con error' } elseif ($j.Name -eq 'servers') { "$(@($res).Count) servers" } else { 'ok' })) }
             try { & $j.Done $res $err } catch { Write-AppLog "Error [$($j.Name)]: $($_.Exception.Message) @ $($_.InvocationInfo.ScriptLineNumber)"; if ($Screenshot) { [IO.File]::AppendAllText("$Screenshot.error.txt", "[$($j.Name)] $($_.Exception.Message) @ $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())`r`n") } }
         }
         if ($script:jobs.Count -eq 0) { $this.Stop() }
@@ -580,9 +620,14 @@ $chkMutation = New-Object Windows.Forms.CheckBox
 $chkMutation.Text = 'Incluir mutaciones'; $chkMutation.AutoSize = $true; $chkMutation.ForeColor = $C.Text
 $chkMutation.Checked = [bool]$settings.IncludeMutations; $chkMutation.Margin = New-Object Windows.Forms.Padding(16, 5, 0, 0)
 (New-Object Windows.Forms.ToolTip).SetToolTip($chkMutation, 'Servers versus con mutaciones u otro modo (realismo, Taaannnkk!, etc.).')
+# Experimental: primero los servers "ideales" (poco ping y los lugares justos para el grupo, así se llena)
+$chkIdeal = New-Object Windows.Forms.CheckBox
+$chkIdeal.Text = 'Primero los ideales (experimental)'; $chkIdeal.AutoSize = $true; $chkIdeal.ForeColor = $C.Text
+$chkIdeal.Checked = [bool]$settings.PreferIdeal; $chkIdeal.Margin = New-Object Windows.Forms.Padding(16, 5, 0, 0)
+(New-Object Windows.Forms.ToolTip).SetToolTip($chkIdeal, "Ordena poniendo primero los que tienen poco ping y justo los lugares que necesitan`n(al entrar ustedes se llena la partida). Los 'seguros' siguen pesando: un 'depende' baja en la lista.")
 $lblPing = New-FieldLabel 'Ping máximo'
 $lblPing.Margin = New-Object Windows.Forms.Padding(0, 6, 6, 0)
-$filters.Controls.AddRange(@($lblPing, $numPing, (New-FieldLabel 'ms'), $chkBig, $chkFriendsOnly, $chkMutation))
+$filters.Controls.AddRange(@($lblPing, $numPing, (New-FieldLabel 'ms'), $chkBig, $chkFriendsOnly, $chkMutation, $chkIdeal))
 
 # Campaña y tipo de server (filtran la ultima busqueda al instante)
 $modeBar = New-Row 40
@@ -834,6 +879,7 @@ function New-Card($r) {
     $chips.Anchor = 'Top, Left, Right'
     $chips.Controls.Add((New-Chip $r.Estado.ToUpper() $statusColor $C.Bg))
 
+    if ($chkIdeal.Checked -and ([int]$r.Max - [int]$r.Humans) -eq [math]::Max(1, [int]$numParty.Value)) { $chips.Controls.Add((New-Chip 'JUSTO PARA USTEDES' $C.Green $C.Bg)) }
     if ($r.Config) { $chips.Controls.Add((New-Chip $r.Config.ToUpper() $C.Blue $C.Bg)) }
     elseif ($r.Competitive) { $chips.Controls.Add((New-Chip 'COMPETITIVO' $C.Blue $C.Bg)) }
     if ($r.Premade) { $chips.Controls.Add((New-Chip "GRUPO ARMADO ($($r.Premade))" $C.CardHi $C.Orange)) }
@@ -1097,6 +1143,17 @@ function Show-Rows {
     if ($null -eq $script:results[$script:view]) { return }
     Invoke-Frozen { Show-RowsCore }
 }
+# Orden "ideal" (experimental): puntaje = ping + 30 por cada lugar de más (después de entrar el grupo)
+# + 60 por cada escalón de duda (Seguro / Probable / Depende). Menor es mejor. Las salas no tienen ping:
+# las de tu región cuentan como 60 ms y las de otra como 200.
+function Get-IdealScore($r, [int]$party) {
+    $extra = [math]::Max(0, [int]$r.Max - [int]$r.Humans - $party)
+    $ping = if ($r.Kind -eq 'lobby') { if ($r.Near) { 60 } else { 200 } } else { [int]$r.Ping }
+    return $ping + 30 * $extra + 60 * [int]$r.Rank
+}
+function Get-IdealOrder($rows, [int]$party) {
+    return @($rows | Sort-Object { Get-IdealScore $_ $party }, Ping)
+}
 function Show-RowsCore {
     $all = $script:results[$script:view]
     $lobbies = $script:view -eq 'lobbies'
@@ -1106,6 +1163,7 @@ function Show-RowsCore {
     $rows = @($all | Where-Object {
             ($sel.Count -eq 0 -or $sel -contains $_.Campaign) -and (Test-ServerType $_ $modes $hosts) -and
             ($showFriendsOnly -or -not $_.FriendsOnly) -and ($showMutation -or -not $_.Mutation) })
+    if ($chkIdeal.Checked) { $rows = @(Get-IdealOrder $rows ([int]$numParty.Value)) }
     Clear-List
     $list.SuspendLayout()
     $script:cardsWidth = Get-CardWidth
@@ -1139,7 +1197,7 @@ $script:cardCache = @{}
 function Get-CardKey([string]$v) {
     $id = { param($o) if ($null -eq $o) { 0 } else { [Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($o) } }
     return @((& $id $script:results[$v]), ((Get-SelectedCampaigns) -join ','), ((Get-Picked $pickMode) -join ','),
-        ((Get-Picked $pickHost) -join ','), $chkFriendsOnly.Checked, $chkMutation.Checked, [int]$numParty.Value,
+        ((Get-Picked $pickHost) -join ','), $chkFriendsOnly.Checked, $chkMutation.Checked, $chkIdeal.Checked, [int]$numParty.Value,
         (& $id $script:imgCache), (Get-CardWidth)) -join '|'
 }
 function Remove-CardCache([string]$v) {
@@ -1218,6 +1276,7 @@ foreach ($it in $campItems.Values) {
 }
 $chkFriendsOnly.add_CheckedChanged({ Show-Rows })
 $chkMutation.add_CheckedChanged({ Show-Rows })
+$chkIdeal.add_CheckedChanged({ Show-Rows })
 foreach ($pick in $pickMode, $pickHost) {
     $pick.Button.add_Click({ $this.Tag.Menu.Show($this, 0, $this.Height) })
     $pick.All.add_Click({
@@ -1371,6 +1430,7 @@ $script:friendNameById = @{}
 $script:partyMap = @{}   # huella -> huella de a quien sigue (de los avisos de cada app)
 $script:groupKey = $null
 $script:groupCount = 0
+$script:seenInGroup = @{}   # huella -> última vez que estuvo en el grupo
 $script:groupData = @()
 $script:avatars = @{}
 $script:avatarTried = @{}
@@ -1531,6 +1591,11 @@ function Update-Group {
     $leaderName = $members[0].Name
     if ($n -le 1) { $members[0].Leader = $false }   # solo: no hay a quién liderar
 
+    # Quién es nuevo de verdad: no estuvo en el grupo en los últimos 30 min (si alguien sale y vuelve
+    # enseguida, por ejemplo al reiniciar la app, no suena de nuevo)
+    $nowT = Get-Date
+    $fresh = @($hashes | Where-Object { $_ -ne $myHash -and (-not $script:seenInGroup.ContainsKey($_) -or ($nowT - $script:seenInGroup[$_]).TotalMinutes -gt 30) })
+    foreach ($h in $hashes) { $script:seenInGroup[$h] = $nowT }
     $hint = if ($n -le 1) { "Solo vos. Tocá 'Unirse a un amigo' para jugar con alguien; si se unen a vos, sos el líder." }
     elseif ($root -eq $myHash) { 'Sos el líder: te siguen a donde vayas.' }
     elseif ($script:followPaused) { 'Seguimiento en pausa.' }
@@ -1548,7 +1613,12 @@ function Update-Group {
         Write-AppLog "Grupo: ahora son $n (líder: $leaderName)"
         $numParty.Value = [math]::Min(4, [math]::Max(1, $n))
         Update-PartyLabel
-        if ($old -gt 0 -and $n -gt $old -and $script:groupLoaded) { [System.Media.SystemSounds]::Asterisk.Play(); $status.Text = "Se sumó alguien al grupo: ahora son $n." }
+        if ($old -gt 0 -and $n -gt $old -and $script:groupLoaded) {
+            # Sonido solo si se sumó alguien nuevo y no estás jugando (con el juego adelante no se sabe de dónde viene)
+            $gameFrontNow = $false; try { $gameFrontNow = [GameFocus]::IsFront() } catch {}
+            if ($fresh.Count -and -not $gameFrontNow) { [System.Media.SystemSounds]::Asterisk.Play() }
+            $status.Text = "Se sumó alguien al grupo: ahora son $n."
+        }
         elseif ($old -gt 0 -and $n -lt $old) { $status.Text = "Alguien salió del grupo: ahora son $n." }
         if ($n -gt 4) { $status.Text = "El grupo tiene $n jugadores: en versus entran hasta 4 por equipo." }
     }
@@ -2022,6 +2092,8 @@ function Request-WhereInfo {
         param($res, $err)
         foreach ($i in @($res)) { if ($i -and $i.Addr) { $script:whereInfo[[string]$i.Addr] = $i } }
         Update-Where
+        # Respaldo: con datos nuevos del server, revisar si hay que esperar lugar o reintentar
+        Invoke-FollowCheck
     }
 }
 
@@ -2031,7 +2103,119 @@ function Request-WhereInfo {
 $confirmTimer = New-Object Windows.Forms.Timer
 $confirmTimer.Interval = 2100
 $confirmTimer.add_Tick({ $this.Stop(); Invoke-FollowCheck })
+$script:connectTo = ''; $script:connectAt = [datetime]::MinValue; $script:waitingSlot = $false
+# ¿La última orden "connect" a este server no funcionó? (pasaron 25 s y Steam no dice que estés ahí)
+function Test-ConnectFailed([string]$server, [string]$myServer) {
+    if ($myServer -eq $server -or $script:connectTo -ne $server) { return $false }
+    return ((Get-Date) - $script:connectAt).TotalSeconds -ge 25
+}
+
+# --- esperar lugar en el server del líder ---
+# Un hilo chico (C#, un solo socket) le pregunta al server cada 1 s cuánta gente tiene (A2S_INFO, un paquete
+# de ~25 bytes) y avisa a la ventana en cuanto hay un lugar. Solo existe mientras estás esperando: al entrar,
+# si el líder se mueve, si pausás o cerrás la app, se apaga. Sin consultas a internet ni tareas pesadas.
+if (-not ('L4dSlotWatch' -as [type])) {
+    Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @"
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
+public class L4dSlotWatch {
+    volatile bool stop;
+    public string Addr;
+    static readonly byte[] Req = Build(null);
+    static byte[] Build(byte[] challenge) {
+        var q = new System.Collections.Generic.List<byte>(new byte[] { 255, 255, 255, 255, 0x54 });
+        q.AddRange(Encoding.ASCII.GetBytes("Source Engine Query")); q.Add(0);
+        if (challenge != null) q.AddRange(challenge);
+        return q.ToArray();
+    }
+    // onFree(jugadores, máximo) se llama una vez, en el hilo de la ventana, al ver un lugar libre
+    public static L4dSlotWatch Start(string addr, int intervalMs, Control ui, Action<int, int> onFree) {
+        var w = new L4dSlotWatch(); w.Addr = addr;
+        var t = new Thread(() => w.Loop(addr, intervalMs, ui, onFree));
+        t.IsBackground = true; t.Priority = ThreadPriority.BelowNormal; t.Start();
+        return w;
+    }
+    void Loop(string addr, int intervalMs, Control ui, Action<int, int> onFree) {
+        int c = addr.LastIndexOf(':');
+        var ep = new IPEndPoint(IPAddress.Parse(addr.Substring(0, c)), int.Parse(addr.Substring(c + 1)));
+        using (var udp = new UdpClient(0)) {
+            udp.Client.ReceiveTimeout = 800;
+            try { udp.Client.IOControl(-1744830452, new byte[] { 0, 0, 0, 0 }, null); } catch { }
+            while (!stop) {
+                var started = DateTime.UtcNow;
+                try {
+                    udp.Send(Req, Req.Length, ep);
+                    var from = new IPEndPoint(IPAddress.Any, 0);
+                    byte[] d = udp.Receive(ref from);
+                    if (d.Length >= 9 && d[4] == 0x41) {   // el server pide el desafío: se repite con él
+                        var r2 = Build(new byte[] { d[5], d[6], d[7], d[8] });
+                        udp.Send(r2, r2.Length, ep);
+                        d = udp.Receive(ref from);
+                    }
+                    if (d.Length > 6 && d[4] == 0x49) {
+                        int p = 6;
+                        for (int s = 0; s < 4; s++) { while (p < d.Length && d[p] != 0) p++; p++; }   // nombre, mapa, carpeta, juego
+                        p += 2;   // appid
+                        if (p + 1 < d.Length) {
+                            int players = d[p], max = d[p + 1];
+                            if (max > 0 && players < max && !stop) {
+                                stop = true;
+                                try { if (!ui.IsDisposed) ui.BeginInvoke(onFree, players, max); } catch { }
+                                return;
+                            }
+                        }
+                    }
+                } catch { }
+                int left = intervalMs - (int)(DateTime.UtcNow - started).TotalMilliseconds;
+                if (left > 0 && !stop) Thread.Sleep(left);
+            }
+        }
+    }
+    public void Stop() { stop = true; }
+}
+"@
+}
+$script:slotWatch = $null; $script:slotTarget = ''; $script:slotSince = [datetime]::MinValue
+function Sync-SlotWatch {
+    $want = if ($script:waitingSlot) { $script:slotTarget } else { '' }
+    if ($script:slotWatch -and $script:slotWatch.Addr -eq $want) { return }
+    if ($script:slotWatch) { $script:slotWatch.Stop(); $script:slotWatch = $null; Write-AppLog 'Dejo de esperar lugar.' }
+    if (-not $want) { return }
+    $script:slotSince = Get-Date
+    Write-AppLog "No entraste a $want (lleno). Lo miro cada 1 s y te meto apenas se libere un lugar."
+    try { $script:slotWatch = [L4dSlotWatch]::Start($want, 1000, $form, [Action[int, int]] { param($pl, $mx) Invoke-SlotFree $pl $mx }) }
+    catch { Write-AppLog "No pude vigilar el server: $($_.Exception.Message)" }
+}
+# Se liberó un lugar: conectar ya, sin la confirmación de 2 s (acá cada segundo cuenta)
+function Invoke-SlotFree([int]$players, [int]$max) {
+    $addr = if ($script:slotWatch) { $script:slotWatch.Addr } else { '' }
+    $script:slotWatch = $null
+    $b = if ($script:steamNow) { @($script:steamNow.friends | Where-Object { [string]$_.id -eq $script:groupLeader }) | Select-Object -First 1 }
+    if (-not $addr -or -not (Test-Following) -or -not $b -or [string]$b.server -ne $addr -or [string]$script:steamNow.me.server -eq $addr) {
+        Write-AppLog "Lugar libre en $addr, pero ya no hace falta (te moviste, pausaste o el líder cambió)."
+        Invoke-FollowCheck; return
+    }
+    Write-AppLog ("Lugar libre en {0} ({1}/{2}) tras {3:N0} s esperando: conecto ya." -f $addr, $players, $max, ((Get-Date) - $script:slotSince).TotalSeconds)
+    $script:waitingSlot = $false; $script:pendingAction = ''; $confirmTimer.Stop()
+    $script:joinedServer = $addr
+    Invoke-FollowCommand "steam://connect/$addr"
+    $status.Text = "Se liberó un lugar en el server de $(Get-FriendName $script:groupLeader): entrando..."
+}
+# 26 s después de cada "connect": si no entraste, pasar a esperar lugar sin depender de otro aviso
+$failCheck = New-Object Windows.Forms.Timer
+$failCheck.Interval = 26000
+$failCheck.add_Tick({ $this.Stop(); Invoke-FollowCheck })
+
 function Invoke-FollowCheck {
+    Invoke-FollowCheckCore
+    Sync-SlotWatch
+}
+function Invoke-FollowCheckCore {
+    $script:waitingSlot = $false
     if (-not (Test-Following)) { return }
     $fid = $script:groupLeader
     $name = Get-FriendName $fid
@@ -2057,6 +2241,19 @@ function Invoke-FollowCheck {
         if ($myServer -eq $bServer) {
             $script:joinedServer = $bServer; if ($bLobby) { $script:followLobby = $bLobby }
             $status.Text = "Estás en el server de $name. Si se cambia de server o arma otro lobby, te llevo."
+        } elseif ($bServer -eq $script:joinedServer -and (Test-ConnectFailed $bServer $myServer)) {
+            # Te mandé a su server pero no entraste (casi siempre: estaba lleno). Se mira el server cada 1 s
+            # (L4dSlotWatch) y apenas se libera un lugar se conecta en el momento.
+            $info = $script:whereInfo[$bServer]
+            $full = $info -and [int]$info.Players -ge [int]$info.MaxPlayers
+            if ($full -or -not $info) {
+                $script:waitingSlot = $true; $script:slotTarget = $bServer
+                $status.Text = "El server de $name está lleno: te meto apenas se libere un lugar. ($($script:followKeyName) pausa)"
+            } elseif (((Get-Date) - $script:connectAt).TotalSeconds -ge 30) {
+                Write-AppLog "Se liberó un lugar en $bServer ($($info.Players)/$($info.MaxPlayers)): reintento."
+                $script:joinedServer = ''
+                $action = "connect|$bServer"
+            }
         } elseif ($bServer -eq $script:joinedServer) {
             $status.Text = "Ya te llevé al server de $name ($bServer). Te llevo de nuevo cuando se mueva."
         } elseif (($bLobby -and ($myLobby -eq $bLobby -or $script:followLobby -eq $bLobby)) -or (-not $bLobby -and $script:followLobby -and $prevLobby -eq $script:followLobby)) {
@@ -2113,6 +2310,7 @@ function Invoke-FollowCheck {
         $chk = Get-First $res2
         if ($chk -and $script:myName -and @($chk.Names) -contains $script:myName) {
             Write-AppLog "Ya estás en $target (te vi en la lista de jugadores): no reconecto."
+            $script:connectTo = ''   # no hace falta reintentar
             $status.Text = "Ya estás en el server de $who."
             return
         }
@@ -2174,7 +2372,8 @@ function Invoke-FollowCommand([string]$url) {
     $front = $false
     try { $front = [GameFocus]::IsFront() } catch {}
     Write-AppLog "ORDEN: $url  (juego adelante: $front)"
-    [System.Media.SystemSounds]::Asterisk.Play()
+    if (-not $front) { [System.Media.SystemSounds]::Asterisk.Play() }   # jugando no: ya se ve que el juego conecta
+    if ($url -like 'steam://connect/*') { $script:connectTo = $url.Substring(16); $script:connectAt = Get-Date; $failCheck.Stop(); $failCheck.Start() }
     Start-Process $url
     if ($front) { $script:refocusUntil = (Get-Date).AddSeconds(15); $script:refocusLogged = $false; $refocusTimer.Start() }
 }
@@ -2281,6 +2480,7 @@ function Request-Update {
     }
 }
 $btnRestart.add_Click({
+        $env:L4D2_RESTART = '1'   # la nueva espera a que esta se cierre (si no, se cerraría por "ya hay una abierta")
         Start-Process -FilePath (Join-Path $here 'Buscar versus.bat') -WorkingDirectory $here
         $form.Close()
     })
@@ -2327,7 +2527,8 @@ $form.add_Shown({
     })
 $form.add_FormClosing({
         try { [void]$hotKey.Set(0) } catch {}
-        $refocusTimer.Stop(); $gameTimer.Stop(); $confirmTimer.Stop(); $reconnectTimer.Stop(); $expireTimer.Stop()
+        $refocusTimer.Stop(); $gameTimer.Stop(); $confirmTimer.Stop(); $reconnectTimer.Stop(); $expireTimer.Stop(); $failCheck.Stop()
+        if ($script:slotWatch) { $script:slotWatch.Stop() }
         if ($script:groupStream) { $script:groupStream.Stop() }
         if ($script:friendsWatcher) { $script:friendsWatcher.EnableRaisingEvents = $false }
         if ($script:watch) { try { $script:watch.Proc.Kill() } catch {} }
@@ -2343,6 +2544,7 @@ $form.add_FormClosing({
         $settings.Campaigns = @(Get-SelectedCampaigns)
         $settings.IncludeFriendsOnly = $chkFriendsOnly.Checked
         $settings.IncludeMutations = $chkMutation.Checked
+        $settings.PreferIdeal = $chkIdeal.Checked
         $settings.ModeFilter = @(Get-Picked $pickMode)
         $settings.HostFilter = @(Get-Picked $pickHost)
         $settings.View = $script:view

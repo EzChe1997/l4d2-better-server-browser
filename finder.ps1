@@ -28,7 +28,7 @@ $keyFile = Join-Path $here 'apikey.txt'
 # ======================= actualizaciones automaticas =======================
 # La app se fija si hay una version nueva publicada en GitHub. El indice (update.json) va firmado
 # con una clave que solo tiene quien publica: si la firma no coincide, la actualizacion se ignora.
-$AppVersion = 7
+$AppVersion = 8
 $updateBase = 'https://raw.githubusercontent.com/EzChe1997/l4d2-better-server-browser/main'   # lo completa publicar.ps1 (https://raw.githubusercontent.com/<usuario>/<repo>/main)
 $updatePublicKey = '<RSAKeyValue><Modulus>3uVFz1ZH9ed0Zun/YcmPi4gk8EALr+R7/DYQY+Fz5NArgRYEo1iNfjNpBUn7G3R0Tliw5DjecmnM0/InLrFLJl2BgMmwJo0VBw4BJ/7qmQm1q7oJoZ0mjI8cgxynbgyhARnQY3i9lVnEGfwB3IOnYhire7XM6iFxui9b5fOd3npzorhJakLqdMdPLBc7BT5VE8E/MfeyhlhusGlKpgsB4QWY3U8WufkkE81E5bziCI1m3RYYUVeoqGukzfujshi2OwV9EBpAIWgDmdZNA3UBDwd6Q0ocq2/EvPfzzNZgNbeQObT+DutokxYEz2e8DlZU0ek46JsxTOFQShlNKoOeHUiXMfjfwUc3j6KqYRNUF1VV9xOzML2W9/+l73r6SnmrPVMItghOEzVivQgZ6gtk3Y901stV4yxTB+RFXO89EFbGYF4C2zhGvdssKxuWibjan9P5D6f/00E6uAb4ehy5MT5Cfj7Iy0Wqo8AmKTOFWOJU8BOjDOu7Odbgi8Xs6dNp</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>'
 $updateFiles = @('finder.ps1', 'ui.ps1', 'vpk.ps1', 'lobbies.ps1', 'Buscar versus.bat')
@@ -70,23 +70,28 @@ function Install-Update([string]$base, [string]$pubKey, [int]$current, [string]$
 
 # >>> BUSQUEDA (desde aca hasta <<< BUSQUEDA lo carga tambien el hilo de fondo de la ventana)
 # ======================= protocolo de consultas de Steam (A2S) =======================
-class PacketReader {
-    [byte[]]$D
-    [int]$P
-    PacketReader([byte[]]$d, [int]$p) { $this.D = $d; $this.P = $p }
-    [bool] More() { return $this.P -lt $this.D.Length }
-    [byte] Byte() { $b = $this.D[$this.P]; $this.P += 1; return $b }
-    [uint16] UShort() { $v = [BitConverter]::ToUInt16($this.D, $this.P); $this.P += 2; return $v }
-    [int] Long() { $v = [BitConverter]::ToInt32($this.D, $this.P); $this.P += 4; return $v }
-    [single] Float() { $v = [BitConverter]::ToSingle($this.D, $this.P); $this.P += 4; return $v }
-    [void] Skip([int]$n) { $this.P += $n }
-    [string] Str() {
-        $start = $this.P
-        while ($this.P -lt $this.D.Length -and $this.D[$this.P] -ne 0) { $this.P += 1 }
-        $s = [Text.Encoding]::UTF8.GetString($this.D, $start, $this.P - $start)
-        $this.P += 1
-        return $s
+# En C# y no como clase de PowerShell: las clases de PowerShell 5.1 quedan atadas al hilo donde se
+# crearon, y esta parte corre en varios hilos a la vez (búsqueda, "dónde está tu grupo", seguir).
+if (-not ('L4dPacketReader' -as [type])) {
+    Add-Type -TypeDefinition @"
+public class L4dPacketReader {
+    public byte[] D; public int P;
+    public L4dPacketReader(byte[] d, int p) { D = d; P = p; }
+    public bool More() { return P < D.Length; }
+    public byte Byte() { return D[P++]; }
+    public ushort UShort() { ushort v = System.BitConverter.ToUInt16(D, P); P += 2; return v; }
+    public int Long() { int v = System.BitConverter.ToInt32(D, P); P += 4; return v; }
+    public float Float() { float v = System.BitConverter.ToSingle(D, P); P += 4; return v; }
+    public void Skip(int n) { P += n; }
+    public string Str() {
+        int start = P;
+        while (P < D.Length && D[P] != 0) P++;
+        string s = System.Text.Encoding.UTF8.GetString(D, start, P - start);
+        P++;
+        return s;
     }
+}
+"@
 }
 
 # Si la ventana define $Pump, los bucles de espera lo llaman para no trabarla
@@ -115,7 +120,7 @@ function Get-Endpoint([string]$addr) {
 }
 
 function ConvertFrom-InfoPacket([byte[]]$d) {
-    $p = [PacketReader]::new($d, 5)
+    $p = [L4dPacketReader]::new($d, 5)
     $i = [ordered]@{}
     [void]$p.Byte()
     $i.Name = $p.Str(); $i.Map = $p.Str(); [void]$p.Str(); [void]$p.Str()
@@ -137,7 +142,7 @@ function ConvertFrom-InfoPacket([byte[]]$d) {
 }
 
 function ConvertFrom-PlayerPacket([byte[]]$d) {
-    $p = [PacketReader]::new($d, 5)
+    $p = [L4dPacketReader]::new($d, 5)
     $n = $p.Byte()
     $list = @()
     for ($k = 0; $k -lt $n -and $p.More(); $k++) {
@@ -304,6 +309,8 @@ function Start-LobbyHelper([string]$dir, [string]$helperArgs, [switch]$Stream) {
 
 function Receive-LobbyHelper($h) {
     if (-not $h.Proc.WaitForExit(45000)) { try { $h.Proc.Kill() } catch {}; throw 'Steam tardó demasiado en responder.' }
+    # La salida puede no cerrarse nunca si algo que arrancó Steam heredó la tubería: no esperar para siempre
+    if (-not $h.Out.Wait(5000)) { throw 'Steam no terminó de responder (la salida quedó abierta).' }
     $text = $h.Out.Result.Trim()
     if ($text -like 'ERROR:*') { throw $text.Substring(6).Trim() }
     if (-not $text.StartsWith('[')) { throw "No pude leer las salas de Steam. $($h.Err.Result.Trim())" }
@@ -329,13 +336,18 @@ function Start-OfficialGamesHelper([string]$dir) {
 # Une cada sala publica con un server oficial de la lista (misma campaña y capitulo, ~misma gente).
 # Devuelve addr -> modo de la sala. Los oficiales con gente que no quedan unidos a ninguna sala
 # casi seguro son de "solo amigos" o privados: conectarse directo te mete igual.
-function Get-OfficialLobbyMatch($servers, [string]$json) {
+# $fakes: servers de comunidades que se anuncian como "official" (p. ej. Lewd4Dead, con mods): las salas
+# "oficiales" pueden estar jugando en ellos. Una sala que coincide con alguno no se une a ningun server de
+# Valve: con "Unirme" el juego te lleva a donde esta la sala de verdad, y podria ser ese server.
+function Get-OfficialLobbyMatch($servers, [string]$json, $fakes = @()) {
     $lobbies = @(($json | ConvertFrom-Json) | ForEach-Object { $_ } | Where-Object {
             [int]$_.'Members:numPlayers' -lt 99 -and [string]$_.'Game:campaign' -match '^L4D2C\d+$' })
     $pairs = foreach ($l in $lobbies) {
         $camp = ([string]$l.'Game:campaign').Substring(4).ToLower()   # L4D2C5 -> c5
         $ch = [int]$l.'Game:chapter'
         $n = [math]::Max([int]$l.'Members:numPlayers', [int]$l._members)
+        $onFake = @($fakes | Where-Object { $_.Map -match '^(c\d+)m(\d+)_' -and $Matches[1] -eq $camp -and [int]$Matches[2] -eq $ch -and [math]::Abs([int]$_.Humans - $n) -le 1 })
+        if ($onFake.Count) { continue }
         foreach ($s in $servers) {
             if ($s.Map -notmatch '^(c\d+)m(\d+)_' -or $Matches[1] -ne $camp -or [int]$Matches[2] -ne $ch) { continue }
             $diff = [math]::Abs($s.Humans - $n)
@@ -606,8 +618,10 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
     foreach ($a in (Get-HistoryServers)) { if (-not $listed.Contains($a)) { [void]$hist.Add($a) } }
     $addrs = @($pre | ForEach-Object { $_.addr }) + @($hist)
     # Mientras se mide el ping, pedirle a Steam las salas publicas de partidas en servers oficiales
-    $offHelper = $null
+    $offHelper = $null; $fakeHelper = $null
     try { $offHelper = Start-OfficialGamesHelper $here } catch {}
+    # Y la lista de servers que se hacen pasar por oficiales (ver Get-OfficialLobbyMatch)
+    try { $fakeHelper = Start-LobbyHelper $here '-Servers -ServerFilter "gamedir=left4dead2,gametagsand=official"' } catch {}
     & $OnStatus "Midiendo ping de $($addrs.Count) servers versus con lugar..."
     # Espera por tanda segun el ping maximo: hacen falta 2 idas y vueltas (desafio + respuesta).
     # Lo que conteste mas tarde igual quedaria afuera por ping.
@@ -639,18 +653,30 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
     $offMatch = $null
     if ($offHelper) {
         & $OnStatus 'Revisando cuáles partidas oficiales son públicas...'
+        # Servers falsos "oficiales" con gente: los de la lista de Steam + los que ya contestaron en esta búsqueda
+        $fakes = @{}
+        foreach ($i in $infos) { if (",$($i.Tags)," -match ',official,' -and $i.Name -notlike 'Valve Left4Dead 2*') { $fakes[$i.Addr] = $i } }
+        if ($fakeHelper) {
+            try {
+                $fakeAddrs = @(((Receive-LobbyHelper $fakeHelper) | ConvertFrom-Json) | ForEach-Object { [string]$_ } | Where-Object { $_ -and -not $fakes.ContainsKey($_) })
+                if ($fakeAddrs.Count) { foreach ($i in @(Invoke-InfoScan $fakeAddrs 40 1500)) { if ($i.Name -notlike 'Valve Left4Dead 2*') { $fakes[$i.Addr] = $i } } }
+            } catch {}
+        }
+        $fakeList = @($fakes.Values | Where-Object { $_.Players -gt 0 } | ForEach-Object { [pscustomobject]@{ Addr = $_.Addr; Map = $_.Map; Humans = $_.Players } })
         try {
             $valveNear = @($near | Where-Object { $_.Name -like 'Valve Left4Dead 2*' } | ForEach-Object {
                     $n = if ($players.ContainsKey($_.Addr)) { @($players[$_.Addr]).Count } else { 0 }
                     [pscustomobject]@{ Addr = $_.Addr; Map = $_.Map; Ping = $_.Ping; Humans = [math]::Max($_.Players, $n) } })
-            $offMatch = Get-OfficialLobbyMatch $valveNear (Receive-LobbyHelper $offHelper)
+            $offMatch = Get-OfficialLobbyMatch $valveNear (Receive-LobbyHelper $offHelper) $fakeList
         } catch { $offMatch = $null }
-    }
+    } elseif ($fakeHelper) { try { $fakeHelper.Proc.Kill() } catch {} }
 
     $rows = foreach ($s in $near) {
         $pl = if ($players.ContainsKey($s.Addr)) { $players[$s.Addr] } else { @() }
         $isValve = $s.Name -like 'Valve Left4Dead 2*'
         $mutation = Test-MutationServer "$($s.Tags)" "$($s.Name)"
+        # Se hace pasar por oficial sin ser de Valve: server con mods (p. ej. Lewd4Dead). Se oculta como las mutaciones.
+        if (",$($s.Tags)," -match ',official,' -and -not ($s.Name -like 'Valve Left4Dead 2*')) { $mutation = $true }
         $friendsOnly = $false
         if ($isValve -and $null -ne $offMatch) {
             if (-not $offMatch.ContainsKey($s.Addr)) { $friendsOnly = $true }
@@ -712,7 +738,7 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
 $settingsFile = Join-Path $here 'settings.json'
 
 function Get-Settings {
-    $s = [ordered]@{ Name = $env:USERNAME; Group = ''; Party = 2; MaxPing = 150; Follow = $false; AutoRefresh = $false; Campaigns = @(); ServerType = ''; LobbyType = ''; ModeFilter = $null; HostFilter = $null; IncludeFriendsOnly = $false; IncludeMutations = $false; FollowKey = 'F5'; View = 'servers'; FollowSteamId = ''; SteamFollow = $false; Share = $true; ClientId = [guid]::NewGuid().ToString('N') }
+    $s = [ordered]@{ Name = $env:USERNAME; Group = ''; Party = 2; MaxPing = 150; Follow = $false; AutoRefresh = $false; Campaigns = @(); ServerType = ''; LobbyType = ''; ModeFilter = $null; HostFilter = $null; IncludeFriendsOnly = $false; IncludeMutations = $false; PreferIdeal = $false; FollowKey = 'F5'; View = 'servers'; FollowSteamId = ''; SteamFollow = $false; Share = $true; ClientId = [guid]::NewGuid().ToString('N') }
     if (Test-Path $settingsFile) {
         try {
             $saved = Get-Content $settingsFile -Raw -Encoding UTF8 | ConvertFrom-Json
