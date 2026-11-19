@@ -10,3 +10,4 @@ resultado-*.txt
 eventos.log
 eventos.anterior.log
 *.lnk
+recientes.json

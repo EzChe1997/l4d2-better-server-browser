@@ -13,6 +13,7 @@ param(
     [string[]]$ExtraFilter = @(),   # un pedido mas, mundial y sin minimo de lugares (p. ej. salas custom)
     # Varios pedidos sueltos en una sola corrida: "distancia|lugares|k=v,k=v;distancia|lugares|k=v..."
     # (reemplaza a Filter/Slots/Distance/ExtraFilter). Cada lobby trae _pass con el numero de pedido.
+    # Un cuarto campo opcional "|k=v,k=v^k=v..." son pedidos mas chicos que se hacen si ese llega a 50.
     [string]$Passes = '',
     [switch]$Dump,
     [switch]$Watch,          # modo vigia (ver abajo)
@@ -358,7 +359,12 @@ public static class L4dLobbies2 {
     }
 
     // Un pedido por elemento: filtros "k=v,k=v", distancia, minimo de lugares y etiqueta (near/far/extra)
-    public static List<Dictionary<string, string>> Fetch(string dll, string[] passFilters, int[] passDist, int[] passSlots, string[] passTags, int timeoutMs) {
+    // passSplit: si un pedido llega al tope de 50 (puede haber mas), en su lugar se hacen estos otros
+    // pedidos mas chicos ("k=v,k=v^k=v,k=v"). Un filtro "k!=v" es "distinto de".
+    public static List<Dictionary<string, string>> Fetch(string dll, string[] passFiltersIn, int[] passDistIn, int[] passSlotsIn, string[] passTagsIn, string[] passSplitIn, int timeoutMs) {
+        var passFilters = new List<string>(passFiltersIn); var passDist = new List<int>(passDistIn);
+        var passSlots = new List<int>(passSlotsIn); var passTags = new List<string>(passTagsIn);
+        var passSplit = new List<string>(passSplitIn);
         h = LoadLibraryW(dll);
         if (h == IntPtr.Zero) throw new Exception("no pude cargar " + dll + " (error " + Marshal.GetLastWin32Error() + ")");
         if (!F<D_Init>("SteamAPI_Init")()) throw new Exception("No me pude conectar a Steam: tiene que estar abierto y con tu cuenta iniciada.");
@@ -384,14 +390,16 @@ public static class L4dLobbies2 {
 
             var list = new List<Dictionary<string, string>>();
             var seen = new HashSet<ulong>();
-            for (int di = 0; di < passFilters.Length; di++) {
+            for (int di = 0; di < passFilters.Count; di++) {
                 // Los filtros se reinician despues de cada pedido: hay que volver a ponerlos
                 distFilter(mm, passDist[di]);
                 countFilter(mm, 50);
                 if (passSlots[di] > 0) slotFilter(mm, passSlots[di]);
                 foreach (string fl in passFilters[di].Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries)) {
                     int eq = fl.IndexOf('=');
-                    if (eq > 0) strFilter(mm, fl.Substring(0, eq), fl.Substring(eq + 1), 0);   // 0 = igual a
+                    if (eq <= 0) continue;
+                    if (fl[eq - 1] == '!') strFilter(mm, fl.Substring(0, eq - 1), fl.Substring(eq + 1), 3);   // 3 = distinto de
+                    else strFilter(mm, fl.Substring(0, eq), fl.Substring(eq + 1), 0);   // 0 = igual a
                 }
                 ulong call = request(mm);
                 if (call == 0) throw new Exception("Steam rechazo el pedido de lobbies");
@@ -410,6 +418,12 @@ public static class L4dLobbies2 {
                     if (!result(ut, call, buf, 4, 510, out failed) || failed) throw new Exception("Steam no devolvio la lista de lobbies");
                     count = (uint)Marshal.ReadInt32(buf);
                 } finally { Marshal.FreeHGlobal(buf); }
+                // Llegó al tope: puede haber más. Se piden las partes (las salas repetidas no se duplican).
+                if (count >= 50 && !string.IsNullOrEmpty(passSplit[di])) {
+                    foreach (string sub in passSplit[di].Split(new char[] { '^' }, StringSplitOptions.RemoveEmptyEntries)) {
+                        passFilters.Add(sub); passDist.Add(passDist[di]); passSlots.Add(passSlots[di]); passTags.Add(passTags[di]); passSplit.Add("");
+                    }
+                }
 
                 for (int i = 0; i < count; i++) {
                     ulong id = byIndex(mm, i);
@@ -437,23 +451,24 @@ public static class L4dLobbies2 {
 '@
 }
 
-$pf = @(); $pd = @(); $ps = @(); $pt = @()
+$pf = @(); $pd = @(); $ps = @(); $pt = @(); $px = @()
 if ($Passes) {
+    # "distancia|lugares|filtros|partes": las partes (opcional) se piden si el pedido llega al tope de 50
     foreach ($spec in ($Passes -split ';' | Where-Object { $_.Trim() })) {
-        $d, $s, $fl = $spec -split '\|', 3
-        $pf += "$fl"; $pd += [int]$d; $ps += [int]$s; $pt += 'pass'
+        $d, $s, $fl, $sp = $spec -split '\|', 4
+        $pf += "$fl"; $pd += [int]$d; $ps += [int]$s; $pt += 'pass'; $px += "$sp"
     }
 } else {
     $base = (@($Filter | ForEach-Object { $_ -split ',' } | Where-Object { $_ })) -join ','
     $first = $true
     foreach ($d in ($Distance -split ',' | Where-Object { $_ })) {
-        $pf += $base; $pd += [int]$d; $ps += $Slots; $pt += $(if ($first) { 'near' } else { 'far' }); $first = $false
+        $pf += $base; $pd += [int]$d; $ps += $Slots; $pt += $(if ($first) { 'near' } else { 'far' }); $px += ''; $first = $false
     }
     $extra = (@($ExtraFilter | ForEach-Object { $_ -split ',' } | Where-Object { $_ })) -join ','
-    if ($extra) { $pf += $extra; $pd += 3; $ps += 0; $pt += 'extra' }   # mundial y sin minimo de lugares
+    if ($extra) { $pf += $extra; $pd += 3; $ps += 0; $pt += 'extra'; $px += '' }   # mundial y sin minimo de lugares
 }
 try {
-    $list = [L4dLobbies2]::Fetch($Dll, [string[]]$pf, [int[]]$pd, [int[]]$ps, [string[]]$pt, 15000)
+    $list = [L4dLobbies2]::Fetch($Dll, [string[]]$pf, [int[]]$pd, [int[]]$ps, [string[]]$pt, [string[]]$px, 15000)
 } catch {
     $e = $_.Exception; while ($e.InnerException) { $e = $e.InnerException }
     [Console]::Out.Write("ERROR: $($e.Message)")

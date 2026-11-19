@@ -886,12 +886,20 @@ function New-Card($r) {
     $chips.BackColor = [Drawing.Color]::Transparent; $chips.WrapContents = $false
     $chips.Location = New-Object Drawing.Point($x, 68); $chips.Size = New-Object Drawing.Size(($W - $x - $rightW - 10), 22)
     $chips.Anchor = 'Top, Left, Right'
+    $isMarked = $r.Kind -ne 'lobby' -and $script:marked.Contains([string]$r.Addr)
+    if ($isMarked) { $chips.Controls.Add((New-Chip 'MARCADO' $C.Text $C.Bg)) }
+    if ($r.Kind -ne 'lobby' -and $script:favs.Contains([string]$r.Addr)) { $chips.Controls.Add((New-Chip 'FAVORITO' $C.Amber $C.Bg)) }
     $chips.Controls.Add((New-Chip $r.Estado.ToUpper() $statusColor $C.Bg))
 
     if ($chkIdeal.Checked -and ([int]$r.Max - [int]$r.Humans) -eq [math]::Max(1, [int]$numParty.Value)) { $chips.Controls.Add((New-Chip 'JUSTO PARA USTEDES' $C.Green $C.Bg)) }
     if ($r.Config) { $chips.Controls.Add((New-Chip $r.Config.ToUpper() $C.Blue $C.Bg)) }
     elseif ($r.Competitive) { $chips.Controls.Add((New-Chip 'COMPETITIVO' $C.Blue $C.Bg)) }
     if ($r.Premade) { $chips.Controls.Add((New-Chip "GRUPO ARMADO ($($r.Premade))" $C.CardHi $C.Orange)) }
+    # Estuviste en este server hace poco (para no volver a entrar sin darte cuenta)
+    if ($r.Kind -ne 'lobby') {
+        $ago = Get-RecentAgo $r.Addr
+        if ($ago) { $chips.Controls.Add((New-Chip $ago.Text $C.CardHi $(if ($ago.Minutes -lt 30) { $C.Orange } else { $C.Dim }))) }
+    }
     if ($r.Idle) { $chips.Controls.Add((New-Chip 'SIN PARTIDA (ESPERAN GENTE)' $C.CardHi $C.Orange)) }
     if ($isLobby) { $chips.Controls.Add((New-Chip 'SALA DE ESPERA' $C.Blue $C.Bg)) }
     if ($isLobby -and $r.Server -eq 'listen') { $chips.Controls.Add((New-Chip 'HOST LOCAL' $C.CardHi $C.Amber)) }
@@ -941,16 +949,115 @@ function New-Card($r) {
     $copy.Location = New-Object Drawing.Point(($W - 176), 80); $copy.Anchor = 'Top, Right'; $copy.Tag = $link
     $copy.add_Click({ Copy-Link $this.Tag })
     # Oficial de Valve todavía sin verificar (búsqueda en curso): sin botones hasta saber si su partida es
-    # pública. Si resulta de solo amigos o de un server falso, la tarjeta se va al terminar la búsqueda.
+    # pública. Si resulta de solo amigos o de un server falso, la tarjeta se va (salvo que esté marcada).
     if ($r.Pending) {
         foreach ($btn in $join, $copy) { $btn.Enabled = $false; $btn.BackColor = $C.CardHi; $btn.ForeColor = $C.Dim }
         $join.Text = Get-UiText 'Verificando...'
-        $tips.SetToolTip($join, 'Revisando si esta partida oficial es pública (no de solo amigos). Tarda unos segundos.')
+        $tips.SetToolTip($join, 'Revisando si esta partida oficial es pública (no de solo amigos). Tarda unos segundos. Tocá la tarjeta para marcarla y no perderla de vista.')
+    }
+
+    # Clic en la tarjeta (fuera de los botones): marcarla. Queda arriba de todo y sigue ahí cuando la lista
+    # se actualiza o se vuelve a buscar (mientras la app esté abierta).
+    $card.Tag = $r
+    if (-not $isLobby) {
+        $card.Cursor = 'Hand'
+        $card.add_MouseClick({
+                param($s, $e)
+                if ($e.Button -eq 'Left') { Request-Mark ([string]$s.Tag.Addr) }
+                elseif ($e.Button -eq 'Right') { Show-CardMenu $s $e.Location }
+            })
+        $tips.SetToolTip($card, "$(if ($isMarked) { 'Marcado. Clic para desmarcarlo.' } else { 'Clic para marcarlo: queda arriba de la lista y no se pierde cuando se actualiza.' })  Clic derecho: favoritos.")
     }
 
     $card.Controls.AddRange(@($strip, $pic, $t, $name, $chips, $hint, $slots, $pips, $slotsSub, $ping, $join, $copy))
-    Convert-CardToImage $card @($join, $copy)
+    $frame = if ($isMarked) { { param($g, $w, $h) $pen = New-Object Drawing.Pen($C.Text, 2); $g.DrawRectangle($pen, 1, 1, $w - 2, $h - 2); $pen.Dispose() } } else { $null }
+    Convert-CardToImage $card @($join, $copy) $frame
     return $card
+}
+
+# ---------------- servers marcados ----------------
+# Direcciones (ip:puerto) marcadas con un clic. Duran mientras la app esté abierta.
+$script:marked = New-Object 'System.Collections.Generic.HashSet[string]'
+function Test-Marked($r) { return $r.Kind -ne 'lobby' -and $script:marked.Contains([string]$r.Addr) }
+function Test-Fav($r) { return $r.Kind -ne 'lobby' -and $script:favs.Contains([string]$r.Addr) }
+# Los marcados primero, después los favoritos y después el resto (cada grupo en el orden que ya tenía)
+function Select-MarkedFirst($rows) {
+    return @(@($rows | Where-Object { Test-Marked $_ }) + @($rows | Where-Object { -not (Test-Marked $_) -and (Test-Fav $_) }) +
+        @($rows | Where-Object { -not (Test-Marked $_) -and -not (Test-Fav $_) }))
+}
+
+# ---------------- favoritos ----------------
+# Servers guardados (clic derecho en la tarjeta). Quedan en settings.json: addr + nombre (para reconocerlos).
+# Cada búsqueda los mide siempre, aunque Steam no los liste y aunque tengan más ping del máximo.
+# Los oficiales de Valve no: cada partida cae en un puerto distinto, guardarlos no sirve para volver.
+$script:favs = New-Object 'System.Collections.Generic.HashSet[string]'
+$script:favNames = @{}
+foreach ($fv in @($settings.Favorites)) { if ($fv -and $fv.Addr) { [void]$script:favs.Add([string]$fv.Addr); $script:favNames[[string]$fv.Addr] = [string]$fv.Name } }
+# Prueba: L4D2_FAKE_FAV=ip:puerto,... (solo con -Screenshot) carga favoritos sin tocar settings.json
+if ($Screenshot -and $env:L4D2_FAKE_FAV) { foreach ($fa in ($env:L4D2_FAKE_FAV -split ',')) { if ($fa) { [void]$script:favs.Add($fa); $script:favNames[$fa] = "prueba $fa" } } }
+function Save-Favorites {
+    $settings.Favorites = @(foreach ($a in $script:favs) { [pscustomobject]@{ Addr = $a; Name = $script:favNames[$a] } })
+    Save-Settings $settings
+}
+$menuCard = New-Object Windows.Forms.ContextMenuStrip
+$menuCard.ShowImageMargin = $false
+$itemFav = New-Object Windows.Forms.ToolStripMenuItem('Agregar a favoritos')
+$itemMark = New-Object Windows.Forms.ToolStripMenuItem('Marcar')
+[void]$menuCard.Items.AddRange(@($itemFav, $itemMark))
+$itemFav.add_Click({
+        $r = $menuCard.Tag; if (-not $r) { return }
+        $a = [string]$r.Addr
+        if ($script:favs.Contains($a)) { [void]$script:favs.Remove($a); $script:favNames.Remove($a) }
+        else { [void]$script:favs.Add($a); $script:favNames[$a] = [string]$r.Nombre }
+        Save-Favorites
+        Request-CardRefresh $a
+    })
+$itemMark.add_Click({ $r = $menuCard.Tag; if ($r) { Request-Mark ([string]$r.Addr) } })
+function Show-CardMenu($card, $pt) {
+    $r = $card.Tag; if (-not $r) { return }
+    $menuCard.Tag = $r
+    $a = [string]$r.Addr
+    if ($r.Valve) {
+        $itemFav.Text = 'Favoritos: no sirve en oficiales (cambian de puerto)'; $itemFav.Enabled = $false
+    } else {
+        $itemFav.Text = if ($script:favs.Contains($a)) { 'Quitar de favoritos' } else { 'Agregar a favoritos' }; $itemFav.Enabled = $true
+    }
+    $itemMark.Text = if ($script:marked.Contains($a)) { 'Desmarcar' } else { 'Marcar' }
+    $menuCard.Show($card, $pt)
+}
+# El clic se atiende un instante después: la tarjeta tocada se reemplaza, y borrarla dentro de su propio
+# evento de clic puede romper lo que Windows sigue haciendo con ese clic.
+$script:markQueue = New-Object System.Collections.ArrayList
+$markTimer = New-Object Windows.Forms.Timer
+$markTimer.Interval = 15
+$markTimer.add_Tick({
+        $this.Stop()
+        $todo = @($script:markQueue); $script:markQueue.Clear()
+        foreach ($a in $todo) { if ($a.StartsWith('=')) { Update-Card $a.Substring(1) $false } else { Switch-Mark $a } }
+    })
+function Request-Mark([string]$addr) { [void]$script:markQueue.Add($addr); $markTimer.Stop(); $markTimer.Start() }
+function Request-CardRefresh([string]$addr) { [void]$script:markQueue.Add("=$addr"); $markTimer.Stop(); $markTimer.Start() }
+function Switch-Mark([string]$addr) {
+    if (-not $addr) { return }
+    if (-not $script:marked.Remove($addr)) { [void]$script:marked.Add($addr) }
+    Update-Card $addr $script:marked.Contains($addr)
+}
+# Rehace la tarjeta de un server (marca o favorito cambiados). $toTop: subirla arriba de todo.
+function Update-Card([string]$addr, [bool]$toTop) {
+    $on = $toTop
+    $old = @($list.Controls | Where-Object { $_ -is [L4dCard] -and $_.Tag -and [string]$_.Tag.Addr -eq $addr }) | Select-Object -First 1
+    if (-not $old) { return }
+    $idx = $list.Controls.GetChildIndex($old)
+    $list.SuspendLayout()
+    try {
+        $card = New-Card $old.Tag
+        $list.Controls.Add($card)
+        # Marcado: arriba de todo. Desmarcado: se queda donde estaba hasta que la lista se reordene.
+        $list.Controls.SetChildIndex($card, $(if ($on) { 0 } else { $idx }))
+        if ($script:liveCards[$addr] -eq $old) { $script:liveCards[$addr] = $card }
+        $list.Controls.Remove($old); $old.Dispose()
+    } finally { $list.ResumeLayout() }
+    if ($on) { $list.ScrollControlIntoView($card) }
 }
 
 # Una tarjeta armada con ~20 controles hace que al scrollear Windows no llegue a repintarlos y queden rayas
@@ -1176,12 +1283,26 @@ function Get-IdealOrder($rows, [int]$party) {
 # Al terminar, la lista se rearma de una con los datos definitivos (tapada con la foto, sin parpadeo).
 $script:liveRows = New-Object System.Collections.ArrayList
 $script:liveCards = @{}
+$script:liveIndex = @{}   # addr -> lugar en liveRows (una fila que vuelve a llegar reemplaza a la anterior)
 $script:liveTaken = 0
-function Reset-LiveRows { $script:liveRows.Clear(); $script:liveCards = @{}; $script:liveTaken = 0 }
+function Reset-LiveRows { $script:liveRows.Clear(); $script:liveCards = @{}; $script:liveIndex = @{}; $script:liveTaken = 0 }
+# Si una fila se muestra con los filtros de ahora. Las marcadas siempre (para no perderlas de vista).
+function Test-RowShown($r, $sel, $modes, $hosts) {
+    if (Test-Marked $r) { return $true }
+    return ($sel.Count -eq 0 -or $sel -contains $r.Campaign) -and (Test-ServerType $r $modes $hosts) -and
+    ($chkFriendsOnly.Checked -or -not $r.FriendsOnly) -and ($chkMutation.Checked -or -not $r.Mutation)
+}
 function Add-LiveRows {
     $state = $script:searchState
     if (-not $state -or -not $state.Rows -or $state.Rows.Count -le $script:liveTaken) { return }
-    while ($script:liveTaken -lt $state.Rows.Count) { [void]$script:liveRows.Add($state.Rows[$script:liveTaken]); $script:liveTaken++ }
+    # Una fila de un server que ya llegó es su versión nueva (un oficial ya verificado): su tarjeta se rehace
+    $dirty = New-Object 'System.Collections.Generic.HashSet[string]'
+    while ($script:liveTaken -lt $state.Rows.Count) {
+        $r = $state.Rows[$script:liveTaken]; $script:liveTaken++
+        $a = [string]$r.Addr
+        if ($script:liveIndex.ContainsKey($a)) { $script:liveRows[$script:liveIndex[$a]] = $r; [void]$dirty.Add($a) }
+        else { $script:liveIndex[$a] = $script:liveRows.Count; [void]$script:liveRows.Add($r) }
+    }
     if ($script:view -ne 'servers') { return }   # se muestran al volver a la pestaña (con la próxima tanda o al terminar)
     $sel = @(Get-SelectedCampaigns)
     $modes = @(Get-Picked $pickMode); $hosts = @(Get-Picked $pickHost)
@@ -1189,9 +1310,13 @@ function Add-LiveRows {
     $list.SuspendLayout()
     try {
         foreach ($r in $script:liveRows) {
-            $show = ($sel.Count -eq 0 -or $sel -contains $r.Campaign) -and (Test-ServerType $r $modes $hosts) -and ($chkMutation.Checked -or -not $r.Mutation)
+            $show = Test-RowShown $r $sel $modes $hosts
             $old = $script:liveCards[$r.Addr]
-            if (-not $show -or ($old -and -not $old.IsDisposed)) { continue }   # (si cambiaste de pestaña, la tarjeta vieja se borró)
+            $alive = $old -and -not $old.IsDisposed   # (si cambiaste de pestaña, la tarjeta vieja se borró)
+            if ($alive -and ($dirty.Contains([string]$r.Addr) -or -not $show)) {
+                $list.Controls.Remove($old); $old.Dispose(); $script:liveCards.Remove($r.Addr); $alive = $false; $added++
+            }
+            if (-not $show -or $alive) { continue }
             if ($added -eq 0) { Hide-Spinner }   # el avance sigue abajo, en la barra de estado
             if (-not $script:cardsWidth) { $script:cardsWidth = Get-CardWidth }
             $card = New-Card $r
@@ -1200,9 +1325,10 @@ function Add-LiveRows {
             $added++
         }
         if ($added) {
-            # Cada tarjeta a su lugar según el orden de la lista
+            # Cada tarjeta a su lugar según el orden de la lista (las marcadas arriba)
             $shown = @($script:liveRows | Where-Object { $script:liveCards[$_.Addr] -and -not $script:liveCards[$_.Addr].IsDisposed })
             $ordered = if ($chkIdeal.Checked) { Get-IdealOrder $shown ([int]$numParty.Value) } else { Sort-ServerRows $shown }
+            $ordered = Select-MarkedFirst $ordered
             $i = 0
             foreach ($r in $ordered) { $list.Controls.SetChildIndex($script:liveCards[$r.Addr], $i); $i++ }
         }
@@ -1214,10 +1340,9 @@ function Show-RowsCore {
     $sel = @(Get-SelectedCampaigns)
     $modes = @(Get-Picked $pickMode); $hosts = @(Get-Picked $pickHost)
     $showFriendsOnly = $chkFriendsOnly.Checked; $showMutation = $chkMutation.Checked
-    $rows = @($all | Where-Object {
-            ($sel.Count -eq 0 -or $sel -contains $_.Campaign) -and (Test-ServerType $_ $modes $hosts) -and
-            ($showFriendsOnly -or -not $_.FriendsOnly) -and ($showMutation -or -not $_.Mutation) })
+    $rows = @($all | Where-Object { Test-RowShown $_ $sel $modes $hosts })
     if ($chkIdeal.Checked) { $rows = @(Get-IdealOrder $rows ([int]$numParty.Value)) }
+    if (-not $lobbies) { $rows = Select-MarkedFirst $rows }
     Clear-List
     $list.SuspendLayout()
     $script:cardsWidth = Get-CardWidth
@@ -1244,6 +1369,18 @@ function Show-RowsCore {
     $hiddenTxt = if ($hidden) { "  $hidden ocultos (solo amigos / mutaciones)." } else { '' }
     $status.Text = "Mostrando $($rows.Count) de $($all.Count) $what ($seguros seguros).$hiddenTxt  Última búsqueda: $($script:times[$script:view])"
     if (-not $lobbies -and $script:serverStats -and $script:serverStats.contestaron) { $status.Text = Get-ServerFunnelText $all $rows $showFriendsOnly $showMutation $seguros }
+    # Marcados que esta búsqueda ya no trajo (se llenaron, quedaron sin gente o dejaron de contestar)
+    if (-not $lobbies -and $script:marked.Count) {
+        $inList = @{}; foreach ($r in $all) { $inList[[string]$r.Addr] = $true }
+        $gone = @($script:marked | Where-Object { -not $inList[$_] }).Count
+        if ($gone) { $status.Text = "$(if ($gone -eq 1) { '1 marcado ya no aparece (se llenó o se vació).' } else { "$gone marcados ya no aparecen (se llenaron o se vaciaron)." })  $($status.Text)" }
+    }
+    # Favoritos que no están ahora (llenos, vacíos o apagados): se nombran, así sabés que se buscaron
+    if (-not $lobbies -and $script:favs.Count -and $script:serverStats) {
+        $inList = @{}; foreach ($r in $all) { $inList[[string]$r.Addr] = $true }
+        $favOut = @($script:favs | Where-Object { -not $inList[$_] } | ForEach-Object { if ($script:favNames[$_]) { $script:favNames[$_] } else { $_ } })
+        if ($favOut.Count) { $status.Text = "Favoritos sin lugar ahora: $($favOut -join ', ').  $($status.Text)" }
+    }
     $tips.SetToolTip($status, $status.Text)   # completo al pasar el mouse, por si no entra
 }
 
@@ -1274,7 +1411,7 @@ function Get-CardKey([string]$v) {
     $id = { param($o) if ($null -eq $o) { 0 } else { [Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($o) } }
     return @((& $id $script:results[$v]), ((Get-SelectedCampaigns) -join ','), ((Get-Picked $pickMode) -join ','),
         ((Get-Picked $pickHost) -join ','), $chkFriendsOnly.Checked, $chkMutation.Checked, $chkIdeal.Checked, [int]$numParty.Value,
-        (& $id $script:imgCache), (Get-CardWidth)) -join '|'
+        (& $id $script:imgCache), (Get-CardWidth), (@($script:marked) -join ','), (@($script:favs) -join ',')) -join '|'
 }
 function Remove-CardCache([string]$v) {
     $entry = $script:cardCache[$v]   # (no usar $c: en PowerShell es lo mismo que $C, la paleta de colores)
@@ -1464,7 +1601,7 @@ $btnSearch.add_Click({
         Reset-LiveRows
         $status.Text = $script:searchState.Msg
         Start-Async 'servers' {
-            param($finder, $p, $ping, $big, $valve, $state)
+            param($finder, $p, $ping, $big, $valve, $state, $favs)
             $ErrorActionPreference = 'Stop'
             $here = Split-Path -Parent $finder
             $keyFile = Join-Path $here 'apikey.txt'
@@ -1472,8 +1609,8 @@ $btnSearch.add_Click({
             $src = [IO.File]::ReadAllText($finder)
             $a = $src.IndexOf('# >>> BUSQUEDA'); $b = $src.IndexOf('# <<< BUSQUEDA')
             . ([scriptblock]::Create($src.Substring($a, $b - $a)))
-            Find-Servers $p $ping $big $valve { param($m) $state.Msg = $m } { param($rows) foreach ($x in $rows) { [void]$state.Rows.Add($x) } } $state.Stats
-        } @((Join-Path $here 'finder.ps1'), [int]$numParty.Value, [int]$numPing.Value, [bool]$chkBig.Checked, $false, $script:searchState) {
+            Find-Servers $p $ping $big $valve { param($m) $state.Msg = $m } { param($rows) foreach ($x in $rows) { [void]$state.Rows.Add($x) } } $state.Stats $favs
+        } @((Join-Path $here 'finder.ps1'), [int]$numParty.Value, [int]$numPing.Value, [bool]$chkBig.Checked, $false, $script:searchState, [string[]]@($script:favs)) {
             param($res, $err)
             Stop-Searching
             Add-LiveRows   # las últimas que hayan llegado
@@ -1899,12 +2036,59 @@ function Start-Watcher {
         Write-AppLog "No pude iniciar el vigía de Steam: $($_.Exception.Message)"
     }
 }
+# ---------------- servers donde estuviste hace poco ----------------
+# Dos fuentes: el historial de Steam (anota cada server al que entrás, con la hora; sirve aunque la app
+# haya estado cerrada) y lo que ve la app mientras jugás (la hora en que saliste), guardado en
+# recientes.json. Se usa la más nueva. Se marcan las últimas 3 horas.
+$recentFile = Join-Path $here 'recientes.json'
+$script:recentLeft = @{}
+try { if (Test-Path $recentFile) { $recentJson = Get-Content $recentFile -Raw | ConvertFrom-Json; foreach ($recentProp in $recentJson.PSObject.Properties) { $script:recentLeft[$recentProp.Name] = [long]$recentProp.Value } } } catch {}
+$script:recentHist = @{}; $script:recentHistRead = [datetime]::MinValue
+function Save-RecentLeave([string]$addr) {
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $script:recentLeft[$addr] = $now
+    foreach ($k in @($script:recentLeft.Keys)) { if ($now - $script:recentLeft[$k] -gt 86400) { $script:recentLeft.Remove($k) } }   # se guarda 1 día
+    if ($Screenshot -or $env:L4D2_TEST_NOGROUP) { return }
+    try { [IO.File]::WriteAllText($recentFile, ($script:recentLeft | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false))) } catch {}
+}
+# Historial de Steam: "ip:puerto" -> hora (unix) en que entraste. Se relee como mucho cada 30 s.
+function Update-RecentHistory {
+    if (((Get-Date) - $script:recentHistRead).TotalSeconds -lt 30) { return }
+    $script:recentHistRead = Get-Date
+    try {
+        $steam = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction SilentlyContinue).SteamPath
+        if (-not $steam -or -not $script:me) { return }
+        $file = Join-Path $steam "userdata\$([int64]$script:me - 76561197960265728)\7\remote\serverbrowser_hist.vdf"
+        if (-not (Test-Path $file)) { return }
+        $h = @{}
+        foreach ($m in [regex]::Matches([IO.File]::ReadAllText($file), '"address"\s+"([^"]+)"\s+"LastPlayed"\s+"(\d+)"')) {
+            $a = $m.Groups[1].Value; $t = [long]$m.Groups[2].Value
+            if (-not $h.ContainsKey($a) -or $t -gt $h[$a]) { $h[$a] = $t }
+        }
+        $script:recentHist = $h
+    } catch {}
+}
+# $null si no estuviste en las últimas 3 h; si no, el texto de la etiqueta y hace cuántos minutos
+function Get-RecentAgo([string]$addr) {
+    if ($script:steamNow -and [string]$script:steamNow.me.server -eq $addr) { return [pscustomobject]@{ Text = 'ESTÁS ACÁ'; Minutes = 0 } }
+    Update-RecentHistory
+    $t = [math]::Max([long]$script:recentLeft[$addr], [long]$script:recentHist[$addr])
+    if ($t -le 0) { return $null }
+    $min = [math]::Floor(([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $t) / 60)
+    if ($min -lt 0 -or $min -ge 180) { return $null }
+    $txt = if ($min -lt 1) { 'ESTUVISTE RECIÉN' } elseif ($min -lt 60) { "ESTUVISTE HACE $min MIN" } else { "ESTUVISTE HACE $([math]::Floor($min / 60)) H" }
+    return [pscustomobject]@{ Text = $txt; Minutes = $min }
+}
+
 function Receive-WatchLine([string]$line) {
     if ($line -like 'ERROR:*') { Write-AppLog "Vigía de Steam: $line"; return }
     if (-not $line.StartsWith('{')) { return }
     try { $now = $line | ConvertFrom-Json } catch { return }
     $before = $script:steamNow
     $script:steamNow = $now
+    # Saliste de un server: anotar cuándo (para la etiqueta "ESTUVISTE HACE ...")
+    $prevSrv = if ($before) { [string]$before.me.server } else { '' }
+    if ($prevSrv -and $prevSrv -ne [string]$now.me.server) { Save-RecentLeave $prevSrv }
     # Saliste de una partida o sala (volviste al menú): buen momento para tener la lista al día
     if ($before -and "$($before.me.server)$($before.me.lobby)" -and -not "$($now.me.server)$($now.me.lobby)") { Invoke-AutoRefresh 'saliste de la partida' 0 }
     Invoke-FollowCheck
@@ -2190,10 +2374,22 @@ $confirmTimer = New-Object Windows.Forms.Timer
 $confirmTimer.Interval = 2100
 $confirmTimer.add_Tick({ $this.Stop(); Invoke-FollowCheck })
 $script:connectTo = ''; $script:connectAt = [datetime]::MinValue; $script:waitingSlot = $false
-# ¿La última orden "connect" a este server no funcionó? (pasaron 25 s y Steam no dice que estés ahí)
+$script:lobbyJoinTo = ''; $script:lobbyJoinAt = [datetime]::MinValue   # última sala a la que te mandé
+$script:slotLobby = ''      # esperando lugar en una partida a la que se entra por su sala (oficiales)
+$script:joinTries = @{}     # server -> reintentos tras quedar afuera (tope, para no entrar en un bucle)
+# ¿La última orden "connect" a este server no funcionó? (pasaron 10 s y Steam no dice que estés ahí).
+# Antes eran 25 s: con el server lleno, tu amigo quedaba afuera todo ese rato sin que nadie lo vigilara.
+# Si en realidad estabas cargando, no pasa nada: antes de reintentar se busca tu nombre en el server.
 function Test-ConnectFailed([string]$server, [string]$myServer) {
     if ($myServer -eq $server -or $script:connectTo -ne $server) { return $false }
-    return ((Get-Date) - $script:connectAt).TotalSeconds -ge 25
+    return ((Get-Date) - $script:connectAt).TotalSeconds -ge 10
+}
+# ¿Te mandé a la sala del líder y no entraste? (8 s después no estás ni en la sala ni en su server).
+# Pasa cuando la partida se llena justo mientras entrás: el juego dice "lleno" y la sala sigue sin vos.
+function Test-LobbyJoinFailed([string]$bServer, [string]$bLobby, [string]$myServer, [string]$myLobby) {
+    if (-not $bServer -or -not $bLobby -or $script:lobbyJoinTo -ne $bLobby) { return $false }
+    if ($myLobby -eq $bLobby -or $myServer -eq $bServer) { return $false }
+    return ((Get-Date) - $script:lobbyJoinAt).TotalSeconds -ge 8
 }
 
 # --- esperar lugar en el server del líder ---
@@ -2285,15 +2481,45 @@ function Invoke-SlotFree([int]$players, [int]$max) {
         Write-AppLog "Lugar libre en $addr, pero ya no hace falta (te moviste, pausaste o el líder cambió)."
         Invoke-FollowCheck; return
     }
-    Write-AppLog ("Lugar libre en {0} ({1}/{2}) tras {3:N0} s esperando: conecto ya." -f $addr, $players, $max, ((Get-Date) - $script:slotSince).TotalSeconds)
+    Write-AppLog ("Lugar libre en {0} ({1}/{2}) tras {3:N0} s esperando: entro ya." -f $addr, $players, $max, ((Get-Date) - $script:slotSince).TotalSeconds)
     $script:waitingSlot = $false; $script:pendingAction = ''; $confirmTimer.Stop()
     $script:joinedServer = $addr
-    Invoke-FollowCommand "steam://connect/$addr"
-    $status.Text = "Se liberó un lugar en el server de $(Get-FriendName $script:groupLeader): entrando..."
+    $script:joinTries[$addr] = 1 + [int]$script:joinTries[$addr]
+    # Oficial al que se entra por su sala: de nuevo por la sala (así es la misma partida del líder)
+    $url = if ($script:slotLobby) { "steam://joinlobby/550/$($script:slotLobby)/$($script:groupLeader)" } else { "steam://connect/$addr" }
+    $script:slotLobby = ''
+    Invoke-JoinUnlessThere $addr $url "Se liberó un lugar en el server de $(Get-FriendName $script:groupLeader): entrando..."
 }
-# 26 s después de cada "connect": si no entraste, pasar a esperar lugar sin depender de otro aviso
+# Manda la orden de entrar, salvo que ya estés en ese server (tu nombre en su lista de jugadores):
+# repetir la orden mientras cargás te puede sacar de la partida.
+function Invoke-JoinUnlessThere([string]$server, [string]$url, [string]$msg) {
+    $script:checkJoin = @{ Server = $server; Url = $url; Msg = $msg }
+    Start-Async 'joincheck' {
+        param($finder, $addr)
+        $src = [IO.File]::ReadAllText($finder)
+        $a = $src.IndexOf('# >>> BUSQUEDA'); $b = $src.IndexOf('# <<< BUSQUEDA')
+        . ([scriptblock]::Create($src.Substring($a, $b - $a)))
+        $pl = Invoke-PlayerScan @($addr) 1500
+        $list = if ($pl.ContainsKey($addr)) { @($pl[$addr]) } else { @() }
+        [pscustomobject]@{ Names = @($list | ForEach-Object { [string]$_.Name }) }
+    } @((Join-Path $here 'finder.ps1'), $server) {
+        param($res2, $err2)
+        $j = $script:checkJoin
+        if (-not $j -or -not (Test-Following)) { return }
+        $chk = Get-First $res2
+        if ($chk -and $script:myName -and @($chk.Names) -contains $script:myName) {
+            Write-AppLog "Ya estás en $($j.Server) (te vi en la lista de jugadores): no mando nada."
+            $script:connectTo = ''; $script:lobbyJoinTo = ''
+            $status.Text = "Ya estás en el server de $(Get-FriendName $script:groupLeader)."
+            return
+        }
+        Invoke-FollowCommand $j.Url
+        $status.Text = $j.Msg
+    }
+}
+# Después de cada orden (connect: 10 s; sala: 8 s): si no entraste, pasar a esperar lugar sin depender de otro aviso
 $failCheck = New-Object Windows.Forms.Timer
-$failCheck.Interval = 26000
+$failCheck.Interval = 10500
 $failCheck.add_Tick({ $this.Stop(); Invoke-FollowCheck })
 
 function Invoke-FollowCheck {
@@ -2323,21 +2549,34 @@ function Invoke-FollowCheckCore {
     # - Un destino nuevo se confirma si sigue igual 2 s (para no reaccionar a estados de paso).
     # - Antes de conectar a un server, si Steam no dice dónde estás, se mira tu nombre en su lista de jugadores.
     $action = ''
+    # Entraste (a su sala o a su server): no hay nada que reintentar
+    if (($myLobby -and $myLobby -eq $script:lobbyJoinTo) -or ($myServer -and $myServer -eq $bServer)) { $script:lobbyJoinTo = ''; $script:joinTries = @{} }
+    $tooMany = $bServer -and [int]$script:joinTries[$bServer] -ge 4
     if ($bServer) {
         if ($myServer -eq $bServer) {
             $script:joinedServer = $bServer; if ($bLobby) { $script:followLobby = $bLobby }
             $status.Text = "Estás en el server de $name. Si se cambia de server o arma otro lobby, te llevo."
+        } elseif ($tooMany -and ((Test-LobbyJoinFailed $bServer $bLobby $myServer $myLobby) -or ($bServer -eq $script:joinedServer -and (Test-ConnectFailed $bServer $myServer)))) {
+            $status.Text = "No pude meterte en el server de $name después de 4 intentos. Entrá a mano o esperá a que se mueva."
+        } elseif (Test-LobbyJoinFailed $bServer $bLobby $myServer $myLobby) {
+            # Te mandé a su sala y no entraste: la partida se llenó justo. Se vigila el server cada 1 s y,
+            # apenas hay lugar (o si ya lo hay), se entra de nuevo por la sala.
+            if (-not $script:waitingSlot -or $script:slotTarget -ne $bServer) { Write-AppLog "No entraste a la sala $bLobby de $name (partida llena?): espero lugar en $bServer." }
+            $script:waitingSlot = $true; $script:slotTarget = $bServer; $script:slotLobby = $bLobby
+            $script:joinedServer = $bServer
+            $status.Text = "La partida de $name se llenó mientras entrabas: te meto apenas se libere un lugar. ($($script:followKeyName) pausa)"
         } elseif ($bServer -eq $script:joinedServer -and (Test-ConnectFailed $bServer $myServer)) {
             # Te mandé a su server pero no entraste (casi siempre: estaba lleno). Se mira el server cada 1 s
             # (L4dSlotWatch) y apenas se libera un lugar se conecta en el momento.
             $info = $script:whereInfo[$bServer]
             $full = $info -and [int]$info.Players -ge [int]$info.MaxPlayers
             if ($full -or -not $info) {
-                $script:waitingSlot = $true; $script:slotTarget = $bServer
+                $script:waitingSlot = $true; $script:slotTarget = $bServer; $script:slotLobby = ''
                 $status.Text = "El server de $name está lleno: te meto apenas se libere un lugar. ($($script:followKeyName) pausa)"
-            } elseif (((Get-Date) - $script:connectAt).TotalSeconds -ge 30) {
+            } elseif (((Get-Date) - $script:connectAt).TotalSeconds -ge 12) {
                 Write-AppLog "Se liberó un lugar en $bServer ($($info.Players)/$($info.MaxPlayers)): reintento."
                 $script:joinedServer = ''
+                $script:joinTries[$bServer] = 1 + [int]$script:joinTries[$bServer]
                 $action = "connect|$bServer"
             }
         } elseif ($bServer -eq $script:joinedServer) {
@@ -2460,6 +2699,8 @@ function Invoke-FollowCommand([string]$url) {
     Write-AppLog "ORDEN: $url  (juego adelante: $front)"
     if (-not $front) { [System.Media.SystemSounds]::Asterisk.Play() }   # jugando no: ya se ve que el juego conecta
     if ($url -like 'steam://connect/*') { $script:connectTo = $url.Substring(16); $script:connectAt = Get-Date; $failCheck.Stop(); $failCheck.Start() }
+    # Sala: anotar a cuál y cuándo, para darse cuenta si no entraste (sala o partida llena)
+    if ($url -match '^steam://joinlobby/550/(\d+)') { $script:lobbyJoinTo = $Matches[1]; $script:lobbyJoinAt = Get-Date; $failCheck.Stop(); $failCheck.Start() }
     Start-Process $url
     if ($front) { $script:refocusUntil = (Get-Date).AddSeconds(15); $script:refocusLogged = $false; $refocusTimer.Start() }
 }
@@ -2728,11 +2969,28 @@ if ($Screenshot) {
                     })
                 $fake.Start()
             }
+            # Prueba de "quedé afuera de la sala": L4D2_FAKE_SLOT=ip:puerto (un server real con lugar). Simula un
+            # líder ahí con la sala 999 y que te mandé a esa sala hace 10 s sin que entraras. Las órdenes NO se
+            # ejecutan: se anotan en <captura>.slot.txt (junto con lo que la app va decidiendo).
+            if ($env:L4D2_FAKE_SLOT) {
+                $script:slotLog = "$Screenshot.slot.txt"
+                function script:Invoke-FollowCommand([string]$url) { [IO.File]::AppendAllText($script:slotLog, "$(Get-Date -Format HH:mm:ss.fff) ORDEN (no ejecutada): $url`r`n"); if ($url -match '^steam://joinlobby/550/(\d+)') { $script:lobbyJoinTo = $Matches[1]; $script:lobbyJoinAt = Get-Date } }
+                $script:groupLeader = '76561190000000001'; $script:followPaused = $false
+                $script:steamNow = ('{"me":{"server":"","lobby":"","playing":true},"friends":[{"id":"76561190000000001","name":"lider","server":"' + $env:L4D2_FAKE_SLOT + '","lobby":"999"}],"lobbies":{}}') | ConvertFrom-Json
+                $script:lobbyJoinTo = '999'; $script:lobbyJoinAt = (Get-Date).AddSeconds(-10); $script:followLobby = '999'; $script:leaderState = "$($env:L4D2_FAKE_SLOT)|999"
+                Invoke-FollowCheck
+                [IO.File]::AppendAllText($script:slotLog, "$(Get-Date -Format HH:mm:ss.fff) decisión: esperando=$($script:waitingSlot) sala=$($script:slotLobby) estado='$($status.Text)'`r`n")
+            }
             # Captura extra a mitad de la busqueda (para ver el spinner)
             $mid = New-Object Windows.Forms.Timer
             $mid.Interval = if ($env:L4D2_SHOT_MID) { [int]$env:L4D2_SHOT_MID } else { 4000 }   # ms (para ver la lista llenándose)
             $mid.add_Tick({
                     $this.Stop()
+                    # Prueba de marcar: L4D2_FAKE_MARK=1 marca la 3ª tarjeta oficial que haya (como un clic)
+                    if ($env:L4D2_FAKE_MARK) {
+                        $pick = @($list.Controls | Where-Object { $_ -is [L4dCard] -and $_.Tag -and $_.Tag.Valve }) | Select-Object -Skip 2 -First 1
+                        if ($pick) { [IO.File]::AppendAllText("$Screenshot.mark.txt", "marcado: $($pick.Tag.Addr) pendiente=$($pick.Tag.Pending)`r`n"); Switch-Mark ([string]$pick.Tag.Addr) }
+                    }
                     $bmp = New-Object Drawing.Bitmap($form.Width, $form.Height)
                     $form.DrawToBitmap($bmp, (New-Object Drawing.Rectangle(0, 0, $form.Width, $form.Height)))
                     $bmp.Save("$Screenshot.cargando.png", [Drawing.Imaging.ImageFormat]::Png)

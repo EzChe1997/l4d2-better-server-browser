@@ -46,4 +46,4 @@ git add -- $files update.json update.sig .gitignore .gitattributes publicar.ps1 
 git commit -q -m "Version $ver$(if ($Notes) { ": $Notes" })"
 if (-not $NoPush) { git push -q origin main; if ($LASTEXITCODE) { throw 'No se pudo subir a GitHub (git push fallo).' } }
 Write-Host ''
-Write-Host "Listo: versión $ver publicada. Tus amigos la reciben la próxima vez que abran la app (o en menos de 6 horas)." -ForegroundColor Green
+Write-Host "Listo: versión $ver publicada. Tus amigos la reciben la próxima vez que abran la app." -ForegroundColor Green

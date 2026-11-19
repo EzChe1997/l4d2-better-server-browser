@@ -28,7 +28,7 @@ $keyFile = Join-Path $here 'apikey.txt'
 # ======================= actualizaciones automaticas =======================
 # La app se fija si hay una version nueva publicada en GitHub. El indice (update.json) va firmado
 # con una clave que solo tiene quien publica: si la firma no coincide, la actualizacion se ignora.
-$AppVersion = 9
+$AppVersion = 10
 $updateBase = 'https://raw.githubusercontent.com/EzChe1997/l4d2-better-server-browser/main'   # lo completa publicar.ps1 (https://raw.githubusercontent.com/<usuario>/<repo>/main)
 $updatePublicKey = '<RSAKeyValue><Modulus>3uVFz1ZH9ed0Zun/YcmPi4gk8EALr+R7/DYQY+Fz5NArgRYEo1iNfjNpBUn7G3R0Tliw5DjecmnM0/InLrFLJl2BgMmwJo0VBw4BJ/7qmQm1q7oJoZ0mjI8cgxynbgyhARnQY3i9lVnEGfwB3IOnYhire7XM6iFxui9b5fOd3npzorhJakLqdMdPLBc7BT5VE8E/MfeyhlhusGlKpgsB4QWY3U8WufkkE81E5bziCI1m3RYYUVeoqGukzfujshi2OwV9EBpAIWgDmdZNA3UBDwd6Q0ocq2/EvPfzzNZgNbeQObT+DutokxYEz2e8DlZU0ek46JsxTOFQShlNKoOeHUiXMfjfwUc3j6KqYRNUF1VV9xOzML2W9/+l73r6SnmrPVMItghOEzVivQgZ6gtk3Y901stV4yxTB+RFXO89EFbGYF4C2zhGvdssKxuWibjan9P5D6f/00E6uAb4ehy5MT5Cfj7Iy0Wqo8AmKTOFWOJU8BOjDOu7Odbgi8Xs6dNp</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>'
 $updateFiles = @('finder.ps1', 'ui.ps1', 'vpk.ps1', 'lobbies.ps1', 'Buscar versus.bat')
@@ -324,13 +324,26 @@ function Get-LobbyJson([int]$party, [string]$dir) {
 }
 
 # Partidas ya empezadas en servers oficiales de Valve con sala PUBLICA (Steam solo lista las publicas).
-# Un pedido por campaña (y por capitulo en las mas jugadas) porque cada pedido trae 50 como mucho.
-function Start-OfficialGamesHelper([string]$dir) {
-    $passes = foreach ($n in 1..14) {
-        if ($n -in 1, 2, 5) { foreach ($ch in 1..5) { "1|0|Game:state=game,Options:server=official,Game:campaign=L4D2C$n,Game:chapter=$ch" } }
-        else { "1|0|Game:state=game,Options:server=official,Game:campaign=L4D2C$n" }
+# Cada pedido trae 50 como mucho, así que se parte: C1, C2 y C5 (las más jugadas) por separado y el resto
+# de las campañas juntas ("distinto de" esas tres). Si alguno llega a 50 (puede haber más), en el mismo
+# proceso se pide en partes: por capítulo, o el resto campaña por campaña. Antes eran 24 pedidos fijos
+# (~10 s); así son 4 casi siempre (~3 s). Steam no deja hacer varios pedidos de salas a la vez desde la
+# misma cuenta (cancela los anteriores): por eso van todos en un único proceso, uno tras otro.
+function Start-OfficialGamesHelpers([string]$dir) {
+    $base = 'Game:state=game,Options:server=official'
+    $passes = foreach ($n in 1, 2, 5) {
+        $parts = foreach ($ch in 1..5) { "$base,Game:campaign=L4D2C$n,Game:chapter=$ch" }
+        "1|0|$base,Game:campaign=L4D2C$n|$($parts -join '^')"
     }
+    $others = @(1..14 | Where-Object { $_ -notin 1, 2, 5 })
+    $parts = foreach ($n in $others) { "$base,Game:campaign=L4D2C$n" }
+    $passes = @($passes) + "1|0|$base,Game:campaign!=L4D2C1,Game:campaign!=L4D2C2,Game:campaign!=L4D2C5|$($parts -join '^')"
     Start-LobbyHelper $dir ('-Passes "{0}"' -f ($passes -join ';'))
+}
+# Junta las salas de todos los procesos (si alguno falla, falla todo: mejor no marcar nada que marcar mal)
+function Receive-OfficialGames($helpers) {
+    $all = foreach ($h in @($helpers)) { (Receive-LobbyHelper $h) | ConvertFrom-Json | ForEach-Object { $_ } }
+    return @($all | Where-Object { $_ -and [int]$_.'Members:numPlayers' -lt 99 -and [string]$_.'Game:campaign' -match '^L4D2C\d+$' })
 }
 
 # Une cada sala publica con un server oficial de la lista (misma campaña y capitulo, ~misma gente).
@@ -339,19 +352,35 @@ function Start-OfficialGamesHelper([string]$dir) {
 # $fakes: servers de comunidades que se anuncian como "official" (p. ej. Lewd4Dead, con mods): las salas
 # "oficiales" pueden estar jugando en ellos. Una sala que coincide con alguno no se une a ningun server de
 # Valve: con "Unirme" el juego te lleva a donde esta la sala de verdad, y podria ser ese server.
-function Get-OfficialLobbyMatch($servers, [string]$json, $fakes = @()) {
-    $lobbies = @(($json | ConvertFrom-Json) | ForEach-Object { $_ } | Where-Object {
-            [int]$_.'Members:numPlayers' -lt 99 -and [string]$_.'Game:campaign' -match '^L4D2C\d+$' })
-    $pairs = foreach ($l in $lobbies) {
-        $camp = ([string]$l.'Game:campaign').Substring(4).ToLower()   # L4D2C5 -> c5
-        $ch = [int]$l.'Game:chapter'
+# Se llama después de cada tanda de la búsqueda: los servers se agrupan por campaña y capítulo una vez,
+# en vez de comparar cada sala con cada server.
+# $prev: el cruce anterior. A igual parecido, cada server se queda con la sala que ya tenía (si no, al
+# sumar servers parecidos las salas saltan de uno a otro y las tarjetas cambian a cada rato).
+function Get-OfficialLobbyMatch($servers, $lobbies, $fakes = @(), $prev = $null) {
+    $byKey = @{}; $fakeKey = @{}
+    foreach ($s in @($servers)) {
+        if ($s.Map -notmatch '^(c\d+)m(\d+)_') { continue }
+        $k = "$($Matches[1])|$([int]$Matches[2])"
+        if (-not $byKey.ContainsKey($k)) { $byKey[$k] = New-Object Collections.ArrayList }
+        [void]$byKey[$k].Add($s)
+    }
+    foreach ($f in @($fakes)) {
+        if ($f.Map -notmatch '^(c\d+)m(\d+)_') { continue }
+        $k = "$($Matches[1])|$([int]$Matches[2])"
+        if (-not $fakeKey.ContainsKey($k)) { $fakeKey[$k] = New-Object Collections.ArrayList }
+        [void]$fakeKey[$k].Add([int]$f.Humans)
+    }
+    $pairs = foreach ($l in @($lobbies)) {
+        $k = "$(([string]$l.'Game:campaign').Substring(4).ToLower())|$([int]$l.'Game:chapter')"   # L4D2C5 -> c5
+        if (-not $byKey.ContainsKey($k)) { continue }
         $n = [math]::Max([int]$l.'Members:numPlayers', [int]$l._members)
-        $onFake = @($fakes | Where-Object { $_.Map -match '^(c\d+)m(\d+)_' -and $Matches[1] -eq $camp -and [int]$Matches[2] -eq $ch -and [math]::Abs([int]$_.Humans - $n) -le 1 })
-        if ($onFake.Count) { continue }
-        foreach ($s in $servers) {
-            if ($s.Map -notmatch '^(c\d+)m(\d+)_' -or $Matches[1] -ne $camp -or [int]$Matches[2] -ne $ch) { continue }
+        if ($fakeKey.ContainsKey($k) -and @($fakeKey[$k] | Where-Object { [math]::Abs($_ - $n) -le 1 }).Count) { continue }
+        foreach ($s in $byKey[$k]) {
             $diff = [math]::Abs($s.Humans - $n)
-            if ($diff -le 1) { [pscustomobject]@{ Addr = $s.Addr; Lobby = [string]$l._id; Mode = [string]$l.'Game:mode'; Diff = $diff; Ping = $s.Ping; Free = [int]$l._limit - [int]$l._members } }
+            if ($diff -le 1) {
+                $keep = if ($prev -and $prev[$s.Addr] -and $prev[$s.Addr].Lobby -eq [string]$l._id) { 0 } else { 1 }
+                [pscustomobject]@{ Addr = $s.Addr; Lobby = [string]$l._id; Mode = [string]$l.'Game:mode'; Diff = $diff; Keep = $keep; Ping = $s.Ping; Free = [int]$l._limit - [int]$l._members }
+            }
         }
     }
     # Primero las salas versus; las mutaciones de versus solo con los servers que sobran
@@ -359,7 +388,7 @@ function Get-OfficialLobbyMatch($servers, [string]$json, $fakes = @()) {
     $versusMutations = 'mutation12', 'mutation15', 'mutation18', 'mutation19', 'community3', 'community6'
     $pairs = @($pairs | Where-Object { $_.Mode -eq 'versus' -or $versusMutations -contains $_.Mode })
     $match = @{}; $usedLobby = @{}
-    foreach ($p in @($pairs | Sort-Object { [int]($_.Mode -ne 'versus') }, Diff, Ping)) {
+    foreach ($p in @($pairs | Sort-Object { [int]($_.Mode -ne 'versus') }, Diff, Keep, Ping)) {
         if ($match.ContainsKey($p.Addr) -or $usedLobby.ContainsKey($p.Lobby)) { continue }
         $match[$p.Addr] = $p; $usedLobby[$p.Lobby] = $true
     }
@@ -659,17 +688,16 @@ function Sort-ServerRows($rows) { return @($rows | Sort-Object Rank, { [int]$_.I
 # se miran sus jugadores y su config, y sus filas salen enseguida por $OnRows (la ventana las va mostrando).
 # Al final se cruzan los oficiales con sus salas públicas y se devuelve la lista completa y definitiva.
 # $Stats (opcional): se llena con cuántos servers hubo y por qué quedó afuera cada uno
-function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValve, [scriptblock]$OnStatus, [scriptblock]$OnRows, [hashtable]$Stats) {
+function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValve, [scriptblock]$OnStatus, [scriptblock]$OnRows, [hashtable]$Stats, [string[]]$Favorites = @()) {
     $stats = if ($null -ne $Stats) { $Stats } else { @{} }
     & $OnStatus 'Pidiendo la lista de servidores a Steam...'
     # Lo que más tarda (salas de los oficiales y servers que se hacen pasar por oficiales) arranca ya, en paralelo
-    $offHelper = $null; $fakeHelper = $null
-    try { $offHelper = Start-OfficialGamesHelper $here } catch {}
+    $offHelpers = @(); $fakeHelper = $null
+    try { $offHelpers = @(Start-OfficialGamesHelpers $here) } catch {}
     try { $fakeHelper = Start-LobbyHelper $here '-Servers -ServerFilter "gamedir=left4dead2,gametagsand=official"' } catch {}
     # Espera por tanda segun el ping maximo: hacen falta 2 idas y vueltas (desafio + respuesta).
     # Lo que conteste mas tarde igual quedaria afuera por ping.
     $wait = [math]::Min(900, 2 * $maxPing + 250)
-    $offPending = [bool]$offHelper
 
     $listed = New-Object 'System.Collections.Generic.HashSet[string]'
     $answered = New-Object 'System.Collections.Generic.HashSet[string]'
@@ -678,21 +706,83 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
     $near = New-Object System.Collections.ArrayList
     $players = @{}; $rules = @{}
     $queue = New-Object 'System.Collections.Generic.List[string]'
+    # Favoritos del usuario: se miden siempre (aunque Steam no los liste) y no se descartan por ping ni tamaño
+    $favSet = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($a in @($Favorites)) { if ($a) { [void]$favSet.Add([string]$a) } }
+    $favMore = @()
+
+    # Verificación de los oficiales, apenas se puede (no al final de todo): en cuanto llegan las salas
+    # públicas y la lista de servers que se hacen pasar por oficiales, cada tanda nueva sale ya verificada
+    # y los oficiales que estaban "Verificando..." se mandan de nuevo con su estado.
+    # Lobbies: salas oficiales ($null = todavía no llegaron). Fakes: addr -> info de los falsos.
+    # Sent: addr -> lo último que se mandó de cada oficial (para mandar solo los que cambian).
+    $off = @{ Lobbies = $null; FakesIn = -not $fakeHelper; Failed = ($offHelpers.Count -eq 0); Match = $null; Fakes = @{}; Sent = @{} }
+    $noteFakes = { param($infos) foreach ($i in $infos) { if (",$($i.Tags)," -match ',official,' -and $i.Name -notlike 'Valve Left4Dead 2*') { $off.Fakes[$i.Addr] = $i } } }
+    # Junta lo que haya llegado. Sin $block no espera a nadie (se llama entre tanda y tanda).
+    $collect = {
+        param([bool]$block)
+        # Los falsos que también están en la lista de versus se miden con su tanda (y se anotan ahí); acá
+        # solo los que no, que son pocos: así no se traba la búsqueda midiéndolos dos veces.
+        if (-not $off.FakesIn -and ($block -or $fakeHelper.Proc.HasExited)) {
+            $off.FakesIn = $true
+            try {
+                $fakeAddrs = @(((Receive-LobbyHelper $fakeHelper) | ConvertFrom-Json) | ForEach-Object { [string]$_ } | Where-Object { $_ -and -not $off.Fakes.ContainsKey($_) -and -not $listed.Contains($_) })
+                if ($fakeAddrs.Count) { & $noteFakes @(Invoke-InfoScan $fakeAddrs 40 ([math]::Max(900, $wait))) }
+            } catch {}
+        }
+        if ($null -eq $off.Lobbies -and -not $off.Failed -and ($block -or -not @($offHelpers | Where-Object { -not $_.Proc.HasExited }).Count)) {
+            try { $off.Lobbies = @(Receive-OfficialGames $offHelpers) } catch { $off.Failed = $true }
+        }
+    }
+    $offReady = { $null -ne $off.Lobbies -and $off.FakesIn }
+    $offPending = { -not $off.Failed -and -not (& $offReady) }
+    # Rehace el cruce con todos los oficiales vistos hasta ahora y devuelve las filas de los que cambiaron
+    # ($skip: los de la tanda en curso, que salen con las demás filas de esa tanda)
+    $refreshValve = {
+        param($skip)
+        if (-not (& $offReady)) { return }
+        $fakeList = @($off.Fakes.Values | Where-Object { $_.Players -gt 0 } | ForEach-Object { [pscustomobject]@{ Addr = $_.Addr; Map = $_.Map; Humans = $_.Players } })
+        $valve = @($near | Where-Object { $_.Name -like 'Valve Left4Dead 2*' })
+        $valveNear = @($valve | ForEach-Object {
+                $n = if ($players.ContainsKey($_.Addr)) { @($players[$_.Addr]).Count } else { 0 }
+                [pscustomobject]@{ Addr = $_.Addr; Map = $_.Map; Ping = $_.Ping; Humans = [math]::Max($_.Players, $n) } })
+        try { $off.Match = Get-OfficialLobbyMatch $valveNear $off.Lobbies $fakeList $off.Match } catch { $off.Failed = $true; $off.Match = $null; return }
+        foreach ($s in $valve) {
+            if (-not $off.Sent.ContainsKey($s.Addr) -or ($skip -and $skip.Contains($s.Addr))) { continue }
+            $m = $off.Match[$s.Addr]
+            $sig = if ($m) { "$($m.Lobby)|$($m.Mode)" } else { 'none' }
+            if ($off.Sent[$s.Addr] -eq $sig) { continue }
+            $off.Sent[$s.Addr] = $sig
+            $plS = if ($players.ContainsKey($s.Addr)) { $players[$s.Addr] } else { @() }
+            ConvertTo-ServerRow $s $plS $rules $off.Match $false $hist $p ($includeBig -or $favSet.Contains($s.Addr))
+        }
+    }
+    $signOf = { param($addr) if (& $offPending) { 'pending' } elseif ($null -eq $off.Match) { 'nomatch' } elseif ($off.Match[$addr]) { "$($off.Match[$addr].Lobby)|$($off.Match[$addr].Mode)" } else { 'none' } }
+    # Entre tandas: si recién llegaron las salas, actualizar los oficiales que ya están en la ventana
+    $tickOfficial = {
+        if (& $offReady) { return }
+        & $collect $false
+        if (& $offReady) {
+            $changed = @(& $refreshValve $null | Where-Object { $_ })
+            if ($OnRows -and $changed.Count) { & $OnRows $changed }
+        }
+    }
 
     # Una tanda: ping + datos; las cercanas con lugar, jugadores y config; y sus filas a la ventana
     $doChunk = {
         param([string[]]$addrs, [int]$waitMs)
         $infos = @(Invoke-InfoScan $addrs 40 $waitMs)
         foreach ($i in $infos) { [void]$answered.Add($i.Addr); [void]$allInfos.Add($i) }
+        & $noteFakes $infos
         # Cada server que queda afuera se cuenta por su motivo (la ventana explica por qué hay pocos)
         $nearNow = @(foreach ($i in $infos) {
                 $why = if ($hist.Contains($i.Addr) -and $i.AppId -ne 550) { 'otro' }
                 elseif (-not (Test-VersusServer "$($i.Tags)" "$($i.Name)")) { 'otro' }
                 elseif ($i.Password -ne 0) { 'clave' }
                 elseif ($i.Players -le 0) { 'vacio' }
-                elseif ($i.Ping -gt $maxPing) { 'ping' }
+                elseif ($i.Ping -gt $maxPing -and -not $favSet.Contains($i.Addr)) { 'ping' }
                 elseif (($i.MaxPlayers - $i.Players) -lt $p) { 'lugar' }
-                elseif (-not ($includeBig -or $i.MaxPlayers -le 8 -or $i.Tags -match 'confogl')) { 'grande' }
+                elseif (-not ($includeBig -or $i.MaxPlayers -le 8 -or $i.Tags -match 'confogl' -or $favSet.Contains($i.Addr))) { 'grande' }
                 else { '' }
                 if ($why) { $stats[$why] = 1 + [int]$stats[$why] } else { $i }
             })
@@ -701,13 +791,23 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
         foreach ($k in $pl.Keys) { $players[$k] = $pl[$k] }
         $comp = @($nearNow | Where-Object { $_.Tags -match 'confogl' } | ForEach-Object { $_.Addr })
         if ($comp.Count) { $r = Invoke-RulesScan $comp 1500; foreach ($k in $r.Keys) { $rules[$k] = $r[$k] } }
+        foreach ($s in $nearNow) { [void]$near.Add($s) }
+        # Si ya están las salas, el cruce se rehace con estos oficiales incluidos (y cambia el de alguno anterior)
+        & $collect $false
+        $now = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($s in $nearNow) { [void]$now.Add($s.Addr) }
+        $changed = @(& $refreshValve $now | Where-Object { $_ })
+        $pend = & $offPending
         $rowsNow = @(foreach ($s in $nearNow) {
-                [void]$near.Add($s)
                 $plS = if ($players.ContainsKey($s.Addr)) { $players[$s.Addr] } else { @() }
-                $row = ConvertTo-ServerRow $s $plS $rules $null $offPending $hist $p $includeBig
-                if ($row) { $row } else { $stats['lugar'] = 1 + [int]$stats['lugar'] }   # sin lugar en un equipo (o grande por su formato)
+                $row = ConvertTo-ServerRow $s $plS $rules $off.Match $pend $hist $p ($includeBig -or $favSet.Contains($s.Addr))
+                if ($row) {
+                    if ($row.Valve) { $off.Sent[$s.Addr] = & $signOf $s.Addr }
+                    $row
+                } else { $stats['lugar'] = 1 + [int]$stats['lugar'] }   # sin lugar en un equipo (o grande por su formato)
             })
-        if ($OnRows -and @($rowsNow).Count) { & $OnRows @($rowsNow) }
+        $rowsNow = @($changed) + @($rowsNow)
+        if ($OnRows -and $rowsNow.Count) { & $OnRows $rowsNow }
     }
 
     # 1) Lista del cliente de Steam (sin key), una dirección por línea apenas llega: se mide mientras tanto
@@ -736,6 +836,7 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
             }
             if ($ended) { break }
             if ((Get-Date) -gt $deadline) { $clientError = 'Steam tardó demasiado en dar la lista de servidores.'; break }
+            & $tickOfficial
             Start-Sleep -Milliseconds 30
         }
         try { if (-not $sh.Proc.HasExited) { $sh.Proc.Kill() } } catch {}
@@ -763,40 +864,55 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
     # 3) Historial y favoritos de Steam (lo que no estaba en la lista pública)
     foreach ($a in (Get-HistoryServers)) { if (-not $listed.Contains($a)) { [void]$hist.Add($a) } }
     if ($hist.Count) { & $doChunk @($hist) $wait }
+    # Favoritos que no vinieron en la lista de Steam ni en el historial
+    $favMore = @($favSet | Where-Object { -not $listed.Contains($_) -and -not $hist.Contains($_) })
+    if ($favMore.Count) { & $doChunk $favMore $wait }
+    & $tickOfficial
 
     # 4) Reintento con mas espera para los que no contestaron (paquetes perdidos o servers lentos)
-    $retry = @(@($listed) + @($hist) | Where-Object { -not $answered.Contains($_) })
+    $retry = @(@($listed) + @($hist) + @($favMore) | Where-Object { -not $answered.Contains($_) })
     if ($retry.Count) {
         & $OnStatus "Reintentando $($retry.Count) servers que no contestaron..."
         & $doChunk $retry ([math]::Min(1500, 2 * $wait))
     }
 
-    # 5) Oficiales de Valve: cual tiene sala publica (y de que modo). Si Steam no contesta, no se marca nada.
-    $offMatch = $null
-    if ($offHelper) {
-        & $OnStatus 'Revisando cuáles partidas oficiales son públicas...'
-        # Servers falsos "oficiales" con gente: los de la lista de Steam + los que ya contestaron en esta búsqueda
-        $fakes = @{}
-        foreach ($i in $allInfos) { if (",$($i.Tags)," -match ',official,' -and $i.Name -notlike 'Valve Left4Dead 2*') { $fakes[$i.Addr] = $i } }
-        if ($fakeHelper) {
-            try {
-                $fakeAddrs = @(((Receive-LobbyHelper $fakeHelper) | ConvertFrom-Json) | ForEach-Object { [string]$_ } | Where-Object { $_ -and -not $fakes.ContainsKey($_) })
-                if ($fakeAddrs.Count) { foreach ($i in @(Invoke-InfoScan $fakeAddrs 40 1500)) { if ($i.Name -notlike 'Valve Left4Dead 2*') { $fakes[$i.Addr] = $i } } }
-            } catch {}
+    # 4b) Los que quedaron en la lista se vuelven a medir: los primeros se midieron hace 10-15 s y en ese
+    #     rato una partida puede llenarse (pasó de entrar a servers que ya estaban llenos). Solo cuenta la
+    #     gente: el ping queda el de la primera medida (todos juntos de una no sirve para medir ping).
+    #     Los que ya no tienen lugar o se vaciaron se sacan; los que no contestan quedan como estaban.
+    if ($near.Count) {
+        & $OnStatus 'Revisando si siguen teniendo lugar...'
+        $fresh = @{}
+        foreach ($i in @(Invoke-InfoScan @($near | ForEach-Object { $_.Addr }) 400 ([math]::Max(700, $wait)))) { $fresh[$i.Addr] = $i }
+        $plNow = if ($fresh.Count) { Invoke-PlayerScan @($fresh.Keys) ([math]::Max(700, $wait)) } else { @{} }
+        $kept = foreach ($s in @($near)) {
+            $f = $fresh[$s.Addr]
+            if (-not $f) { $s; continue }
+            $f.Ping = $s.Ping
+            if ($plNow.ContainsKey($s.Addr)) { $players[$s.Addr] = $plNow[$s.Addr] }
+            $n = if ($players.ContainsKey($s.Addr)) { [math]::Max($f.Players, @($players[$s.Addr]).Count) } else { $f.Players }
+            if ($f.Players -le 0) { $stats['vacio'] = 1 + [int]$stats['vacio'] }
+            elseif (($f.MaxPlayers - $n) -lt $p) { $stats['lugar'] = 1 + [int]$stats['lugar'] }
+            else { $f }
         }
-        $fakeList = @($fakes.Values | Where-Object { $_.Players -gt 0 } | ForEach-Object { [pscustomobject]@{ Addr = $_.Addr; Map = $_.Map; Humans = $_.Players } })
-        try {
-            $valveNear = @($near | Where-Object { $_.Name -like 'Valve Left4Dead 2*' } | ForEach-Object {
-                    $n = if ($players.ContainsKey($_.Addr)) { @($players[$_.Addr]).Count } else { 0 }
-                    [pscustomobject]@{ Addr = $_.Addr; Map = $_.Map; Ping = $_.Ping; Humans = [math]::Max($_.Players, $n) } })
-            $offMatch = Get-OfficialLobbyMatch $valveNear (Receive-LobbyHelper $offHelper) $fakeList
-        } catch { $offMatch = $null }
-    } elseif ($fakeHelper) { try { $fakeHelper.Proc.Kill() } catch {} }
+        $near.Clear()
+        foreach ($s in @($kept)) { [void]$near.Add($s) }
+    }
+
+    # 5) Oficiales de Valve: cual tiene sala publica (y de que modo). Si Steam no contesta, no se marca nada.
+    #    Casi siempre ya quedó resuelto durante la búsqueda; si no, se espera acá lo que falte.
+    if ($off.Failed -and $fakeHelper -and -not $off.FakesIn) { try { $fakeHelper.Proc.Kill() } catch {}; $off.FakesIn = $true }
+    if (-not (& $offReady) -and -not $off.Failed) {
+        & $OnStatus 'Revisando cuáles partidas oficiales son públicas...'
+        & $collect $true
+    }
+    [void](& $refreshValve $null)   # con todo lo que contestó (también los del reintento)
+    $offMatch = if ($off.Failed) { $null } else { $off.Match }
 
     # 6) Lista definitiva (los oficiales ya con su sala, o marcados como de solo amigos)
     $rows = foreach ($s in $near) {
         $pl = if ($players.ContainsKey($s.Addr)) { $players[$s.Addr] } else { @() }
-        ConvertTo-ServerRow $s $pl $rules $offMatch $false $hist $p $includeBig
+        ConvertTo-ServerRow $s $pl $rules $offMatch $false $hist $p ($includeBig -or $favSet.Contains($s.Addr))
     }
     $rows = Sort-ServerRows @($rows | Where-Object { $_ })
     $stats['listados'] = $listed.Count + $hist.Count
@@ -814,7 +930,7 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
 $settingsFile = Join-Path $here 'settings.json'
 
 function Get-Settings {
-    $s = [ordered]@{ Name = $env:USERNAME; Group = ''; Party = 2; MaxPing = 150; Follow = $false; AutoRefresh = $false; Campaigns = @(); ServerType = ''; LobbyType = ''; ModeFilter = $null; HostFilter = $null; IncludeFriendsOnly = $false; IncludeMutations = $false; PreferIdeal = $false; FollowKey = 'F5'; View = 'servers'; FollowSteamId = ''; SteamFollow = $false; Share = $true; ClientId = [guid]::NewGuid().ToString('N') }
+    $s = [ordered]@{ Name = $env:USERNAME; Group = ''; Party = 2; MaxPing = 150; Follow = $false; AutoRefresh = $false; Campaigns = @(); ServerType = ''; LobbyType = ''; ModeFilter = $null; HostFilter = $null; IncludeFriendsOnly = $false; IncludeMutations = $false; PreferIdeal = $false; FollowKey = 'F5'; View = 'servers'; FollowSteamId = ''; SteamFollow = $false; Share = $true; Favorites = @(); ClientId = [guid]::NewGuid().ToString('N') }
     if (Test-Path $settingsFile) {
         try {
             $saved = Get-Content $settingsFile -Raw -Encoding UTF8 | ConvertFrom-Json
