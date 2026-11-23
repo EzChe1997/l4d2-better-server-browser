@@ -28,7 +28,7 @@ $keyFile = Join-Path $here 'apikey.txt'
 # ======================= actualizaciones automaticas =======================
 # La app se fija si hay una version nueva publicada en GitHub. El indice (update.json) va firmado
 # con una clave que solo tiene quien publica: si la firma no coincide, la actualizacion se ignora.
-$AppVersion = 10
+$AppVersion = 11
 $updateBase = 'https://raw.githubusercontent.com/EzChe1997/l4d2-better-server-browser/main'   # lo completa publicar.ps1 (https://raw.githubusercontent.com/<usuario>/<repo>/main)
 $updatePublicKey = '<RSAKeyValue><Modulus>3uVFz1ZH9ed0Zun/YcmPi4gk8EALr+R7/DYQY+Fz5NArgRYEo1iNfjNpBUn7G3R0Tliw5DjecmnM0/InLrFLJl2BgMmwJo0VBw4BJ/7qmQm1q7oJoZ0mjI8cgxynbgyhARnQY3i9lVnEGfwB3IOnYhire7XM6iFxui9b5fOd3npzorhJakLqdMdPLBc7BT5VE8E/MfeyhlhusGlKpgsB4QWY3U8WufkkE81E5bziCI1m3RYYUVeoqGukzfujshi2OwV9EBpAIWgDmdZNA3UBDwd6Q0ocq2/EvPfzzNZgNbeQObT+DutokxYEz2e8DlZU0ek46JsxTOFQShlNKoOeHUiXMfjfwUc3j6KqYRNUF1VV9xOzML2W9/+l73r6SnmrPVMItghOEzVivQgZ6gtk3Y901stV4yxTB+RFXO89EFbGYF4C2zhGvdssKxuWibjan9P5D6f/00E6uAb4ehy5MT5Cfj7Iy0Wqo8AmKTOFWOJU8BOjDOu7Odbgi8Xs6dNp</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>'
 $updateFiles = @('finder.ps1', 'ui.ps1', 'vpk.ps1', 'lobbies.ps1', 'Buscar versus.bat')
@@ -1053,10 +1053,13 @@ $followTopic = Get-Topic 'steam-follow-v2'   # v2: avisos cada 4 min que valen 1
 
 # Todas las apps avisan (con o sin grupo): asi tus amigos ven que tenes la app abierta y en que grupo estas.
 # $Closed = se cerro la app (deja de figurar enseguida, sin esperar a que venza el aviso).
-function Send-FollowSignal([string]$me, [string]$leader, [switch]$Closed) {
+# $Go: el líder tocó Unirme ("lobby:<id>" o "connect:<ip:puerto>"): los que lo siguen entran al instante,
+# sin esperar a que Steam les pase dónde está (1-3 s) ni la confirmación de 2 s. Vale también como aviso normal.
+function Send-FollowSignal([string]$me, [string]$leader, [switch]$Closed, [string]$Go = '') {
     $fh = if ($leader) { Get-SidHash $leader } else { '' }
     $msg = @{ h = (Get-SidHash $me); f = $fh }
     if ($Closed) { $msg.c = 1 }
+    if ($Go) { $msg.go = $Go }
     $body = $msg | ConvertTo-Json -Compress
     [void](Invoke-RestMethod -Method Post -Uri "https://ntfy.sh/$followTopic" -TimeoutSec 5 `
             -Body ([Text.Encoding]::UTF8.GetBytes($body)) -ContentType 'text/plain; charset=utf-8')

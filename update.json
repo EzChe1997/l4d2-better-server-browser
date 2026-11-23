@@ -1,10 +1,10 @@
 {
-    "version":  10,
-    "notes":  "Oficiales verificados en ~3 s, la lista final revisa si siguen teniendo lugar, marcar servers con clic, favoritos (clic derecho), etiqueta ESTUVISTE HACE arreglada y el seguidor ya no queda afuera si la partida se llena",
-    "date":  "2026-11-19 01:56",
+    "version":  11,
+    "notes":  "Seguir al instante: al tocar Unirme, tu grupo entra en medio segundo (antes 3-5 s). Necesitan v11 el lider y los que siguen",
+    "date":  "2026-11-23 13:06",
     "files":  {
-                  "finder.ps1":  "fe7754c4ebec2ca50b38d39f2c9b0b6d23ce70efb18c6295a0afb10baf7f5e60",
-                  "ui.ps1":  "66d647a219444d680e992e0afb61b750fef46ae6fd0ff1df2f02613c5fd22640",
+                  "finder.ps1":  "2c6543dcfcb948cf4db274209e84fc732277a500d3b6c4e6aa4888241530b969",
+                  "ui.ps1":  "86dfc2e96542e408e95e8d6b61e57fc00bb826c141190d30f0d6b9418aa2ce3b",
                   "vpk.ps1":  "a33358afe20ca8d31901f90d36340322c476b68899215d26a9ee91daad9d40c5",
                   "lobbies.ps1":  "ddf0aa1991f1449285d13c7850156c1b4bb91a88cffd76e7dace8674b543df77",
                   "Buscar versus.bat":  "608546897db095fcb0bc007ee31048185cddc1d8862f04cc2a74e0318628fcb6"

@@ -1549,6 +1549,7 @@ $gameFront.add_Tick({
 function Invoke-Join([string]$link) {
     Write-AppLog "Unirme (botón): $link"
     Start-Process $link
+    Send-GoSignal $link
     if (Show-Game) { $gameFront.Stop(); $gameFront.Start() }
     if ($link -like 'steam://joinlobby/*') {
         $status.Text = 'Entrando a la sala...  Si "Compartir mi partida" está tildado, tus amigos que te siguen entran solos.'
@@ -1556,6 +1557,22 @@ function Invoke-Join([string]$link) {
         $status.Text = "Entrando a $($link -replace '^steam://connect/')...  Si quedan en equipos distintos: ESC > Cambiar de equipo."
     }
 }
+
+# Sos el líder de un grupo y tocaste Unirme: avisar a tu grupo adónde vas, para que entren al instante
+# (sin esto, sus apps se enteran cuando Steam les pasa dónde estás: 1-3 s más la confirmación de 2 s).
+# Un solo mensaje por clic, por la misma vía que los avisos del grupo.
+function Send-GoSignal([string]$link) {
+    if (-not $script:me -or $script:groupLeader -or $script:groupCount -lt 2 -or (Test-NtfyPaused) -or $Screenshot -or $env:L4D2_TEST_NOGROUP) { return }
+    $go = if ($link -match '^steam://joinlobby/550/(\d+)') { "lobby:$($Matches[1])" } elseif ($link -match '^steam://connect/(\d{1,3}(?:\.\d{1,3}){3}:\d+)$') { "connect:$($Matches[1])" } else { '' }
+    if (-not $go) { return }
+    $script:goSent++
+    Start-Async "go$($script:goSent)" { param($me, $go) Send-FollowSignal $me '' -Go $go } @($script:me, $go) {
+        param($res, $err)
+        if ($err) { Write-AppLog "No pude avisarle a tu grupo adónde vas: $err"; Set-NtfyError $err }
+    }
+    Write-AppLog "Aviso a tu grupo: $go"
+}
+$script:goSent = 0
 
 function Copy-Link([string]$link) {
     $text = if ($link -like 'steam://connect/*') { $a = $link -replace '^steam://connect/'; "$link   (pegalo en Win+R)   o en la consola del juego: connect $a" }
@@ -1883,6 +1900,38 @@ function Receive-GroupLine([string]$line) {
     $script:partyMsgs[$h] = [pscustomobject]@{ Topic = $followTopic; Time = [long]$m.time; Data = $d }
     # Al conectar llegan de golpe los avisos de los últimos 20 min: se aplican todos juntos
     $groupApply.Stop(); $groupApply.Start()
+    # El líder tocó Unirme: ir ya (solo avisos recientes: al reconectar llegan también los viejos)
+    if ($d.go -and ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$m.time) -le 20) { Invoke-LeaderGo $h ([string]$d.go) ([string]$m.id) }
+}
+# Aviso "voy para allá" del líder (o de quien encabeza la cadena del grupo). Solo se aceptan destinos con
+# forma de sala (número) o de server (ip:puerto): nada más que eso se le puede mandar al juego.
+$script:goDone = @{}
+$script:goTarget = ''; $script:goUntil = [datetime]::MinValue
+function Invoke-LeaderGo([string]$h, [string]$go, [string]$id) {
+    if (-not (Test-Following) -or ($id -and $script:goDone[$id])) { return }
+    $lh = Get-SidHash $script:groupLeader
+    $root = try { Get-PartyRoot $lh $script:partyMap } catch { '' }
+    if ($h -ne $lh -and $h -ne $root) { return }
+    if ($id) { $script:goDone[$id] = $true }
+    $kind, $target = $go -split ':', 2
+    $mine = if ($script:steamNow) { $script:steamNow.me } else { $null }
+    $who = Get-FriendName $script:groupLeader
+    if ($kind -eq 'lobby' -and $target -match '^\d{1,20}$') {
+        if ($mine -and [string]$mine.lobby -eq $target) { return }
+        Write-AppLog "Aviso al instante del líder: sala $target"
+        $script:pendingAction = ''; $confirmTimer.Stop()
+        $script:followLobby = $target; $script:joinedServer = ''
+        $script:goTarget = $target; $script:goUntil = (Get-Date).AddSeconds(10)
+        Invoke-FollowCommand "steam://joinlobby/550/$target"
+    } elseif ($kind -eq 'connect' -and $target -match '^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$') {
+        if ($mine -and [string]$mine.server -eq $target) { return }
+        Write-AppLog "Aviso al instante del líder: server $target"
+        $script:pendingAction = ''; $confirmTimer.Stop()
+        $script:joinedServer = $target
+        $script:goTarget = $target; $script:goUntil = (Get-Date).AddSeconds(10)
+        Invoke-FollowCommand "steam://connect/$target"
+    } else { return }
+    $status.Text = "$who eligió una partida: te llevo ya. ($($script:followKeyName) pausa el seguimiento)"
 }
 function Update-PartyFromMessages {
     $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
@@ -2543,6 +2592,15 @@ function Invoke-FollowCheckCore {
     if ($state -ne $script:leaderState) { $script:leaderLobby = $bLobby }
     $script:leaderState = $state
 
+    # Recién te llevé por un aviso al instante del líder: Steam tarda 1-3 s en mostrar que se movió, y
+    # mientras tanto dice que sigue donde estaba. Hasta que Steam lo muestre en el destino nuevo (o 10 s),
+    # no hacer caso a lo viejo: si no, te mandaría de vuelta a la partida anterior.
+    if ($script:goTarget) {
+        if ($bLobby -eq $script:goTarget -or $bServer -eq $script:goTarget) { $script:goTarget = '' }
+        elseif ((Get-Date) -lt $script:goUntil) { $script:pendingAction = ''; $confirmTimer.Stop(); return }
+        else { Write-AppLog "Steam no mostró al líder en $($script:goTarget) a los 10 s: sigo lo que dice Steam."; $script:goTarget = '' }
+    }
+
     # Reglas (cualquier orden de mas saca al juego de la partida en la que estás):
     # - Si ya estás en su mismo server o lobby, no se hace nada.
     # - Si entraste a su lobby, al arrancar la partida el juego te lleva con el lobby: no conectar a mano.
@@ -2980,6 +3038,31 @@ if ($Screenshot) {
                 $script:lobbyJoinTo = '999'; $script:lobbyJoinAt = (Get-Date).AddSeconds(-10); $script:followLobby = '999'; $script:leaderState = "$($env:L4D2_FAKE_SLOT)|999"
                 Invoke-FollowCheck
                 [IO.File]::AppendAllText($script:slotLog, "$(Get-Date -Format HH:mm:ss.fff) decisión: esperando=$($script:waitingSlot) sala=$($script:slotLobby) estado='$($status.Text)'`r`n")
+            }
+            # Prueba del aviso al instante: L4D2_FAKE_GO=1. Simula que seguís a un líder que está en el server
+            # 1.2.3.4:27015, llega su aviso "voy a la sala 777" y Steam tarda en mostrarlo. Órdenes a <captura>.go.txt
+            if ($env:L4D2_FAKE_GO) {
+                $script:slotLog = "$Screenshot.go.txt"
+                function script:Invoke-FollowCommand([string]$url) { [IO.File]::AppendAllText($script:slotLog, "$(Get-Date -Format HH:mm:ss.fff) ORDEN (no ejecutada): $url`r`n"); if ($url -match '^steam://joinlobby/550/(\d+)') { $script:lobbyJoinTo = $Matches[1]; $script:lobbyJoinAt = Get-Date } }
+                $note = { param($t) [IO.File]::AppendAllText($script:slotLog, "$(Get-Date -Format HH:mm:ss.fff) $t  | estado='$($status.Text)'`r`n") }
+                $lid = '76561190000000001'
+                $script:groupLeader = $lid; $script:followPaused = $false
+                $old = '{"me":{"server":"","lobby":"","playing":true},"friends":[{"id":"' + $lid + '","name":"lider","server":"1.2.3.4:27015","lobby":"555"}],"lobbies":{}}'
+                $script:steamNow = $old | ConvertFrom-Json; $script:joinedServer = '1.2.3.4:27015'; $script:followLobby = '555'; $script:leaderState = '1.2.3.4:27015|555'
+                $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+                Receive-GroupLine ('{"id":"viejo1","event":"message","time":' + ($now - 300) + ',"message":"{\"h\":\"' + (Get-SidHash $lid) + '\",\"f\":\"\",\"go\":\"lobby:111\"}"}')
+                & $note 'aviso VIEJO (5 min) recibido: no debe hacer nada'
+                Receive-GroupLine ('{"id":"malo1","event":"message","time":' + $now + ',"message":"{\"h\":\"' + (Get-SidHash $lid) + '\",\"f\":\"\",\"go\":\"lobby:1;calc\"}"}')
+                & $note 'aviso con destino raro recibido: no debe hacer nada'
+                Receive-GroupLine ('{"id":"bueno1","event":"message","time":' + $now + ',"message":"{\"h\":\"' + (Get-SidHash $lid) + '\",\"f\":\"\",\"go\":\"lobby:777\"}"}')
+                & $note 'aviso bueno recibido: debe haber UNA orden a la sala 777'
+                Invoke-FollowCheck
+                & $note 'Steam todavía muestra al líder en el server viejo: no debe mandar nada'
+                Receive-GroupLine ('{"id":"bueno1","event":"message","time":' + $now + ',"message":"{\"h\":\"' + (Get-SidHash $lid) + '\",\"f\":\"\",\"go\":\"lobby:777\"}"}')
+                & $note 'mismo aviso repetido: no debe repetir la orden'
+                $script:steamNow = ('{"me":{"server":"","lobby":"777","playing":true},"friends":[{"id":"' + $lid + '","name":"lider","server":"","lobby":"777"}],"lobbies":{}}') | ConvertFrom-Json
+                Invoke-FollowCheck
+                & $note "Steam ya muestra al líder en la sala 777 y a vos también: nada que hacer (goTarget='$($script:goTarget)')"
             }
             # Captura extra a mitad de la busqueda (para ver el spinner)
             $mid = New-Object Windows.Forms.Timer
