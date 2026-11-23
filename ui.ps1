@@ -385,6 +385,28 @@ $btnViewServers = New-FlatButton (Get-UiText 'Partidas en curso') $C.Input $C.Ca
 $btnViewLobbies = New-FlatButton (Get-UiText 'Salas de espera') $C.Input $C.CardHi 164 32
 $btnViewServers.Location = New-Object Drawing.Point(400, 20)
 $btnViewLobbies.Location = New-Object Drawing.Point(576, 20)
+# Qué modo de juego se busca (uno a la vez, en las dos pestañas): versus, versus realista, versus
+# supervivencia o búsqueda. Al cambiarlo se vuelve a buscar.
+$script:game = if ($gameModes.Contains([string]$settings.Game)) { [string]$settings.Game } else { 'versus' }
+if ($Screenshot -and $env:L4D2_GAME -and $gameModes.Contains($env:L4D2_GAME)) { $script:game = $env:L4D2_GAME }   # pruebas
+$btnGame = New-FlatButton '' $C.Input $C.CardHi 150 32
+$btnGame.Location = New-Object Drawing.Point(750, 20)
+$menuGame = New-Object Windows.Forms.ContextMenuStrip
+$menuGame.ShowCheckMargin = $true; $menuGame.ShowImageMargin = $false
+$gameItems = [ordered]@{}
+foreach ($k in $gameModes.Keys) {
+    $it = New-Object Windows.Forms.ToolStripMenuItem($gameModes[$k])
+    $it.Tag = $k
+    $it.add_Click({ Set-Game ([string]$this.Tag) })
+    [void]$menuGame.Items.Add($it)
+    $gameItems[$k] = $it
+}
+$btnGame.add_Click({ $menuGame.Show($btnGame, (New-Object Drawing.Point(0, $btnGame.Height))) })
+function Update-GameButton {
+    $short = @{ versus = 'Versus'; mutation12 = 'V. realista'; mutation15 = 'V. supervivencia'; scavenge = 'Búsqueda' }
+    $btnGame.Text = Get-UiText "$($short[$script:game])  ▾"
+    foreach ($k in $gameItems.Keys) { $gameItems[$k].Checked = $k -eq $script:game }
+}
 
 # Fondo del encabezado con arte del juego (mapas\ui_*.png, se extraen la primera vez): una franja del
 # fondo del menu oscurecida, el logo a la izquierda y el borde rasgado abajo.
@@ -428,13 +450,16 @@ function Update-HeaderArt {
     $title.Location = New-Object Drawing.Point((28 + $lw), [int](($H - 14 - $title.Height) / 2))   # centrado sobre el borde rasgado
     $x = [math]::Max(400, $title.Right + 30)
     $btnViewServers.Left = $x; $btnViewLobbies.Left = $x + $btnViewServers.Width
+    $btnGame.Left = $btnViewLobbies.Right + 12
 }
 $btnViewServers.Tag = 'servers'; $btnViewLobbies.Tag = 'lobbies'
 $tips = New-Object Windows.Forms.ToolTip
 $tips.SetToolTip($chkAuto, 'Actualiza la lista al volver a esta ventana (si tiene más de 2 min) y cuando salís de una partida o sala.')
 $tips.SetToolTip($btnViewServers, 'Servers con una partida ya empezada y lugar libre')
 $tips.SetToolTip($btnViewLobbies, 'Salas que todavía no arrancaron, como las del buscador del juego')
-$header.Controls.AddRange(@($title, $btnViewServers, $btnViewLobbies, $chkAuto, $btnSearch))
+$tips.SetToolTip($btnGame, 'Modo de juego a buscar: versus, versus realista, versus supervivencia o búsqueda (scavenge)')
+Update-GameButton
+$header.Controls.AddRange(@($title, $btnViewServers, $btnViewLobbies, $btnGame, $chkAuto, $btnSearch))
 Update-HeaderArt
 
 # Ícono de la app: el "4" rojo de L4D2 (el del spinner, sacado del juego) con una lupa blanca en la
@@ -1288,6 +1313,7 @@ $script:liveTaken = 0
 function Reset-LiveRows { $script:liveRows.Clear(); $script:liveCards = @{}; $script:liveIndex = @{}; $script:liveTaken = 0 }
 # Si una fila se muestra con los filtros de ahora. Las marcadas siempre (para no perderlas de vista).
 function Test-RowShown($r, $sel, $modes, $hosts) {
+    if ($r.OtherMode) { return $false }   # no es del modo de juego elegido
     if (Test-Marked $r) { return $true }
     return ($sel.Count -eq 0 -or $sel -contains $r.Campaign) -and (Test-ServerType $r $modes $hosts) -and
     ($chkFriendsOnly.Checked -or -not $r.FriendsOnly) -and ($chkMutation.Checked -or -not $r.Mutation)
@@ -1349,9 +1375,14 @@ function Show-RowsCore {
     foreach ($r in $rows) { $list.Controls.Add((New-Card $r)) }
     $list.ResumeLayout()
     Request-WorkshopImages
-    if ($all.Count -eq 0) {
-        Show-Message $(if ($lobbies) { 'No hay salas de espera de versus con lugar para ustedes ahora. Probá de nuevo en un rato.' }
-            else { 'No hay servers con lugar. Probá subir el ping máximo o buscar de nuevo en un rato.' })
+    if ($all.Count -eq 0 -or ($script:game -ne 'versus' -and $rows.Count -eq 0)) {
+        $gm = $gameModes[$script:game]
+        if ($script:game -ne 'versus') {
+            Show-Message "No hay $(if ($lobbies) { 'salas de espera' } else { 'partidas' }) de $($gm.ToLower()) con lugar para ustedes ahora. Se juega mucho menos que el versus: mirá también en $(if ($lobbies) { 'Partidas en curso' } else { 'Salas de espera' }) o probá en un rato."
+        } else {
+            Show-Message $(if ($lobbies) { 'No hay salas de espera de versus con lugar para ustedes ahora. Probá de nuevo en un rato.' }
+                else { 'No hay servers con lugar. Probá subir el ping máximo o buscar de nuevo en un rato.' })
+        }
     } elseif ($rows.Count -eq 0) {
         $onlyComp = $modes.Count -and $modes -notcontains 'vanilla'
         $wantsRare = ($sel -contains 'custom') -or $onlyComp
@@ -1398,7 +1429,10 @@ function Get-ServerFunnelText($all, $rows, [bool]$showFriendsOnly, [bool]$showMu
     if ($fo) { $hid += "$fo de solo amigos" }
     if ($mu) { $hid += "$mu mutaciones" }
     if ($byFilter) { $hid += "$byFilter por campaña / modo / server" }
-    $txt = "Mostrando $($rows.Count) de $base servers versus con gente ($seguros seguros)."
+    $gm = if ($script:game -eq 'versus') { 'versus' } else { "de $($gameModes[$script:game].ToLower())" }
+    $txt = "Mostrando $($rows.Count) de $base servers $gm con gente ($seguros seguros)."
+    # Versus realista / supervivencia: solo cuentan los oficiales con sala de ese modo (la base sería todo el versus)
+    if ($script:game -match '^mutation') { return "Mostrando $($rows.Count) partidas $gm ($seguros seguras): son oficiales de Valve con sala pública de ese modo.  $($script:times.servers)" }
     if ($out.Count) { $txt += "  Afuera: $($out -join ', ')." }
     if ($hid.Count) { $txt += "  Ocultos: $($hid -join ', ')." }
     return "$txt  $($script:times.servers)"
@@ -1581,6 +1615,21 @@ function Copy-Link([string]$link) {
     $status.Text = 'Link copiado. Pegáselo a tus amigos (Discord/WhatsApp).'
 }
 
+# Elegiste otro modo de juego: las listas de los dos modos ya no sirven. Se busca de nuevo en la pestaña
+# que estás viendo (la otra se busca sola al abrirla). Si había una búsqueda en curso, al terminar se
+# descarta y se busca de nuevo con el modo nuevo.
+function Set-Game([string]$g) {
+    if (-not $gameModes.Contains($g) -or $g -eq $script:game) { return }
+    $script:game = $g; $settings.Game = $g
+    Update-GameButton
+    Write-AppLog "Modo de juego: $($gameModes[$g])"
+    $script:results.servers = $null; $script:results.lobbies = $null
+    $script:lobbyJson = $null
+    Remove-CardCache 'servers'; Remove-CardCache 'lobbies'
+    if ($btnSearch.Enabled) { $btnSearch.PerformClick() }
+    else { $status.Text = "Cambiaste a $($gameModes[$g]): busco de nuevo apenas termine esta búsqueda." }
+}
+
 function Stop-Searching {
     Hide-Spinner
     $form.Cursor = 'Default'
@@ -1595,11 +1644,12 @@ $btnSearch.add_Click({
         Show-Spinner $(if ($script:view -eq 'lobbies') { 'Buscando salas de espera...' } else { 'Buscando partidas en curso...' })
         if ($script:view -eq 'lobbies') {
             # Las salas se piden a Steam en un proceso aparte (en segundo plano: la ventana no se traba)
-            $status.Text = 'Pidiéndole a Steam las salas de espera de versus...'
-            $script:lobbyArgs = @{ Party = [int]$numParty.Value; HideValve = $false }   # el $done corre en otro alcance
-            Start-Async 'lobbies' { param($p, $dir) Get-LobbyJson $p $dir } @($script:lobbyArgs.Party, $here) {
+            $status.Text = "Pidiéndole a Steam las salas de espera de $($gameModes[$script:game].ToLower())..."
+            $script:lobbyArgs = @{ Party = [int]$numParty.Value; HideValve = $false; Game = $script:game }   # el $done corre en otro alcance
+            Start-Async 'lobbies' { param($p, $dir, $game) Get-LobbyJson $p $dir $game } @($script:lobbyArgs.Party, $here, $script:game) {
                 param($res, $err)
                 Stop-Searching
+                if ($script:lobbyArgs.Game -ne $script:game) { $btnSearch.PerformClick(); return }   # cambiaste de modo mientras buscaba
                 if ($err) { $status.Text = "Error: $err"; return }
                 $script:lobbyJson = [string](Get-First $res); $script:lobbyJsonParty = $script:lobbyArgs.Party
                 try { if (Update-CustomIndexFromLobbies $script:customIx $script:lobbyJson) { Save-CustomIndex $script:customIx $customFile } } catch {}
@@ -1614,11 +1664,11 @@ $btnSearch.add_Click({
 
         # La busqueda corre en otro hilo: la ventana sigue respondiendo y abajo se ve el avance
         # Rows: las filas que la búsqueda va encontrando (la ventana las muestra a medida que llegan)
-        $script:searchState = [hashtable]::Synchronized(@{ Msg = 'Pidiendo la lista de servidores a Steam...'; Rows = [Collections.ArrayList]::Synchronized((New-Object Collections.ArrayList)); Stats = [hashtable]::Synchronized(@{}) })
+        $script:searchState = [hashtable]::Synchronized(@{ Game = $script:game; Msg = 'Pidiendo la lista de servidores a Steam...'; Rows = [Collections.ArrayList]::Synchronized((New-Object Collections.ArrayList)); Stats = [hashtable]::Synchronized(@{}) })
         Reset-LiveRows
         $status.Text = $script:searchState.Msg
         Start-Async 'servers' {
-            param($finder, $p, $ping, $big, $valve, $state, $favs)
+            param($finder, $p, $ping, $big, $valve, $state, $favs, $game)
             $ErrorActionPreference = 'Stop'
             $here = Split-Path -Parent $finder
             $keyFile = Join-Path $here 'apikey.txt'
@@ -1626,10 +1676,12 @@ $btnSearch.add_Click({
             $src = [IO.File]::ReadAllText($finder)
             $a = $src.IndexOf('# >>> BUSQUEDA'); $b = $src.IndexOf('# <<< BUSQUEDA')
             . ([scriptblock]::Create($src.Substring($a, $b - $a)))
-            Find-Servers $p $ping $big $valve { param($m) $state.Msg = $m } { param($rows) foreach ($x in $rows) { [void]$state.Rows.Add($x) } } $state.Stats $favs
-        } @((Join-Path $here 'finder.ps1'), [int]$numParty.Value, [int]$numPing.Value, [bool]$chkBig.Checked, $false, $script:searchState, [string[]]@($script:favs)) {
+            Find-Servers $p $ping $big $valve { param($m) $state.Msg = $m } { param($rows) foreach ($x in $rows) { [void]$state.Rows.Add($x) } } $state.Stats $favs $game
+        } @((Join-Path $here 'finder.ps1'), [int]$numParty.Value, [int]$numPing.Value, [bool]$chkBig.Checked, $false, $script:searchState, [string[]]@($script:favs), $script:game) {
             param($res, $err)
             Stop-Searching
+            # Cambiaste de modo mientras buscaba: esta lista ya no sirve, se busca de nuevo
+            if ($script:searchState.Game -ne $script:game) { Reset-LiveRows; if ($script:view -eq 'servers') { $btnSearch.PerformClick() } else { $script:results.servers = $null }; return }
             Add-LiveRows   # las últimas que hayan llegado
             if ($err) {
                 if ($script:view -eq 'servers') { Clear-List }

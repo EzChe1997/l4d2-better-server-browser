@@ -28,7 +28,7 @@ $keyFile = Join-Path $here 'apikey.txt'
 # ======================= actualizaciones automaticas =======================
 # La app se fija si hay una version nueva publicada en GitHub. El indice (update.json) va firmado
 # con una clave que solo tiene quien publica: si la firma no coincide, la actualizacion se ignora.
-$AppVersion = 11
+$AppVersion = 12
 $updateBase = 'https://raw.githubusercontent.com/EzChe1997/l4d2-better-server-browser/main'   # lo completa publicar.ps1 (https://raw.githubusercontent.com/<usuario>/<repo>/main)
 $updatePublicKey = '<RSAKeyValue><Modulus>3uVFz1ZH9ed0Zun/YcmPi4gk8EALr+R7/DYQY+Fz5NArgRYEo1iNfjNpBUn7G3R0Tliw5DjecmnM0/InLrFLJl2BgMmwJo0VBw4BJ/7qmQm1q7oJoZ0mjI8cgxynbgyhARnQY3i9lVnEGfwB3IOnYhire7XM6iFxui9b5fOd3npzorhJakLqdMdPLBc7BT5VE8E/MfeyhlhusGlKpgsB4QWY3U8WufkkE81E5bziCI1m3RYYUVeoqGukzfujshi2OwV9EBpAIWgDmdZNA3UBDwd6Q0ocq2/EvPfzzNZgNbeQObT+DutokxYEz2e8DlZU0ek46JsxTOFQShlNKoOeHUiXMfjfwUc3j6KqYRNUF1VV9xOzML2W9/+l73r6SnmrPVMItghOEzVivQgZ6gtk3Y901stV4yxTB+RFXO89EFbGYF4C2zhGvdssKxuWibjan9P5D6f/00E6uAb4ehy5MT5Cfj7Iy0Wqo8AmKTOFWOJU8BOjDOu7Odbgi8Xs6dNp</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>'
 $updateFiles = @('finder.ps1', 'ui.ps1', 'vpk.ps1', 'lobbies.ps1', 'Buscar versus.bat')
@@ -317,10 +317,11 @@ function Receive-LobbyHelper($h) {
     return $text
 }
 
-function Get-LobbyJson([int]$party, [string]$dir) {
-    # Pedido extra: todas las salas versus con campaña custom del mundo (son pocas y quedan fuera de las 50 cercanas).
+function Get-LobbyJson([int]$party, [string]$dir, [string]$game = 'versus') {
+    # Pedido extra: todas las salas del modo con campaña custom del mundo (son pocas y quedan fuera de las 50 cercanas).
     # Sirven para mostrarlas y para aprender qué campaña de la Workshop es cada mapa custom.
-    Receive-LobbyHelper (Start-LobbyHelper $dir ('-Slots {0} -Filter "Game:mode=versus,Game:state=lobby,System:access=public" -ExtraFilter "Game:mode=versus,Game:MissionInfo:BuiltIn=0"' -f $party))
+    if ($game -notmatch '^(versus|mutation12|mutation15|scavenge)$') { $game = 'versus' }
+    Receive-LobbyHelper (Start-LobbyHelper $dir ('-Slots {0} -Filter "Game:mode={1},Game:state=lobby,System:access=public" -ExtraFilter "Game:mode={1},Game:MissionInfo:BuiltIn=0"' -f $party, $game))
 }
 
 # Partidas ya empezadas en servers oficiales de Valve con sala PUBLICA (Steam solo lista las publicas).
@@ -356,22 +357,26 @@ function Receive-OfficialGames($helpers) {
 # en vez de comparar cada sala con cada server.
 # $prev: el cruce anterior. A igual parecido, cada server se queda con la sala que ya tenía (si no, al
 # sumar servers parecidos las salas saltan de uno a otro y las tarjetas cambian a cada rato).
-function Get-OfficialLobbyMatch($servers, $lobbies, $fakes = @(), $prev = $null) {
+# $game: el modo buscado; sus salas van primero. En Búsqueda el "capítulo" de la sala no es el número del
+# mapa (sala C8 cap. 2 = c8m5_rooftop), así que ahí se cruza solo por campaña y cantidad de gente.
+function Get-OfficialLobbyMatch($servers, $lobbies, $fakes = @(), $prev = $null, [string]$game = 'versus') {
+    $byCamp = $game -eq 'scavenge'
     $byKey = @{}; $fakeKey = @{}
     foreach ($s in @($servers)) {
         if ($s.Map -notmatch '^(c\d+)m(\d+)_') { continue }
-        $k = "$($Matches[1])|$([int]$Matches[2])"
+        $k = if ($byCamp) { $Matches[1] } else { "$($Matches[1])|$([int]$Matches[2])" }
         if (-not $byKey.ContainsKey($k)) { $byKey[$k] = New-Object Collections.ArrayList }
         [void]$byKey[$k].Add($s)
     }
     foreach ($f in @($fakes)) {
         if ($f.Map -notmatch '^(c\d+)m(\d+)_') { continue }
-        $k = "$($Matches[1])|$([int]$Matches[2])"
+        $k = if ($byCamp) { $Matches[1] } else { "$($Matches[1])|$([int]$Matches[2])" }
         if (-not $fakeKey.ContainsKey($k)) { $fakeKey[$k] = New-Object Collections.ArrayList }
         [void]$fakeKey[$k].Add([int]$f.Humans)
     }
     $pairs = foreach ($l in @($lobbies)) {
-        $k = "$(([string]$l.'Game:campaign').Substring(4).ToLower())|$([int]$l.'Game:chapter')"   # L4D2C5 -> c5
+        $camp = ([string]$l.'Game:campaign').Substring(4).ToLower()   # L4D2C5 -> c5
+        $k = if ($byCamp) { $camp } else { "$camp|$([int]$l.'Game:chapter')" }
         if (-not $byKey.ContainsKey($k)) { continue }
         $n = [math]::Max([int]$l.'Members:numPlayers', [int]$l._members)
         if ($fakeKey.ContainsKey($k) -and @($fakeKey[$k] | Where-Object { [math]::Abs($_ - $n) -le 1 }).Count) { continue }
@@ -383,12 +388,12 @@ function Get-OfficialLobbyMatch($servers, $lobbies, $fakes = @(), $prev = $null)
             }
         }
     }
-    # Primero las salas versus; las mutaciones de versus solo con los servers que sobran
+    # Primero las salas del modo buscado; las de otros modos parecidos solo con los servers que sobran
     # (las de coop no: esos servers se anuncian como coop y ni estan en la lista)
-    $versusMutations = 'mutation12', 'mutation15', 'mutation18', 'mutation19', 'community3', 'community6'
-    $pairs = @($pairs | Where-Object { $_.Mode -eq 'versus' -or $versusMutations -contains $_.Mode })
+    $similar = if ($byCamp) { @('scavenge', 'teamscavenge') } else { @('versus', 'mutation12', 'mutation15', 'mutation18', 'mutation19', 'community3', 'community6') }
+    $pairs = @($pairs | Where-Object { $similar -contains $_.Mode })
     $match = @{}; $usedLobby = @{}
-    foreach ($p in @($pairs | Sort-Object { [int]($_.Mode -ne 'versus') }, Diff, Keep, Ping)) {
+    foreach ($p in @($pairs | Sort-Object { [int]($_.Mode -ne $game) }, Diff, Keep, Ping)) {
         if ($match.ContainsKey($p.Addr) -or $usedLobby.ContainsKey($p.Lobby)) { continue }
         $match[$p.Addr] = $p; $usedLobby[$p.Lobby] = $true
     }
@@ -523,7 +528,8 @@ function ConvertTo-LobbyRows([string]$json, [int]$p, [bool]$hideValve) {
         $title = if ($camp -ne 'custom') { $campaigns[$camp] }
         elseif ($l.'Game:MissionInfo:DisplayTitle' -and -not ([string]$l.'Game:MissionInfo:DisplayTitle').StartsWith('#')) { $l.'Game:MissionInfo:DisplayTitle' }
         else { $campRaw }
-        $title = "$title  ·  Capítulo $chapter"
+        # En Búsqueda el número de la sala no es el capítulo de la campaña
+        $title = if ([string]$l.'Game:mode' -eq 'scavenge') { "$title  ·  Búsqueda" } else { "$title  ·  Capítulo $chapter" }
 
         # Mismo criterio que en los servers: aunque los reparta parejo, ¿queda un equipo con lugar para todos?
         $seguro = [math]::Floor($h / 2) -le (4 - $p)
@@ -588,6 +594,16 @@ function Get-Verdict($info, $players, [int]$p, [int]$team = 0) {
 }
 
 # ¿Es versus? Por la etiqueta del modo; si el server no publica ninguna etiqueta, por el nombre.
+# Modos que se pueden buscar (el valor es el Game:mode de las salas de Steam)
+$gameModes = [ordered]@{ versus = 'Versus'; mutation12 = 'Versus realista'; mutation15 = 'Versus supervivencia'; scavenge = 'Búsqueda' }
+# Versus realista y versus supervivencia son mutaciones: los servers se anuncian como versus común. En los
+# oficiales se sabe por su sala; en los de la comunidad, solo si el nombre lo dice.
+$gameNameRx = @{ mutation12 = '(?i)realis'; mutation15 = '(?i)surviv|superviv' }
+function Test-GameServer([string]$tags, [string]$name, [string]$game) {
+    if ($game -eq 'scavenge') { return ",$tags," -match '(?i),scavenge,' -or (-not $tags.Trim() -and $name -match '(?i)scavenge') }
+    return Test-VersusServer $tags $name
+}
+
 function Test-VersusServer([string]$tags, [string]$name) {
     if ($tags -match 'versus') { return $true }
     return (-not $tags.Trim() -and $name -match '(?i)versus|zone\s*mod|zonepug|\bvs\b|\b\dv\d\b')
@@ -619,16 +635,26 @@ function Get-SteamServerList([string]$dir) {
 
 # Fila de la lista para un server ($null si no sirve). $offPending: todavía no se sabe qué oficiales tienen
 # sala pública; los de Valve salen "en verificación" (sin poder unirse) hasta saberlo.
-function ConvertTo-ServerRow($s, $pl, $rules, $offMatch, [bool]$offPending, $hist, [int]$p, [bool]$includeBig) {
+function ConvertTo-ServerRow($s, $pl, $rules, $offMatch, [bool]$offPending, $hist, [int]$p, [bool]$includeBig, [string]$game = 'versus') {
     $isValve = $s.Name -like 'Valve Left4Dead 2*'
-    $mutation = Test-MutationServer "$($s.Tags)" "$($s.Name)"
+    # En Búsqueda la etiqueta "scavenge" es el modo buscado, no una mutación
+    $modeTags = if ($game -eq 'scavenge') { (@("$($s.Tags)" -split ',' | Where-Object { $_ -ne 'scavenge' })) -join ',' } else { "$($s.Tags)" }
+    $mutation = Test-MutationServer $modeTags "$($s.Name)"
     # Se hace pasar por oficial sin ser de Valve: server con mods (p. ej. Lewd4Dead). Se oculta como las mutaciones.
     if (",$($s.Tags)," -match ',official,' -and -not $isValve) { $mutation = $true }
     $friendsOnly = $false; $pending = $false
     if ($isValve -and $offPending) { $pending = $true }
     elseif ($isValve -and $null -ne $offMatch) {
         if (-not $offMatch.ContainsKey($s.Addr)) { $friendsOnly = $true }
-        elseif ($offMatch[$s.Addr].Mode -ne 'versus') { $mutation = $true }
+        elseif ($offMatch[$s.Addr].Mode -ne $game) { $mutation = $true }
+    }
+    # OtherMode: no es del modo buscado (la ventana no la muestra). En versus realista / supervivencia: un
+    # oficial solo si su sala es de ese modo (mientras se verifica, oculto: casi todos resultan versus común);
+    # uno de la comunidad solo si el nombre lo dice.
+    $otherMode = $false
+    if ($gameNameRx.ContainsKey($game)) {
+        if ($isValve) { $otherMode = $pending -or $friendsOnly -or $null -eq $offMatch -or $mutation }
+        else { $otherMode = "$($s.Name)" -notmatch $gameNameRx[$game]; $mutation = $false }
     }
     # Oficial con sala publica: se entra por la SALA, no conectando al server. Asi siempre es una partida
     # publica (el cruce sala<->server es aproximado, y conectar directo a un server ajeno te mete en
@@ -676,7 +702,7 @@ function ConvertTo-ServerRow($s, $pl, $rules, $offMatch, [bool]$offPending, $his
         Hint = $v.Hint; Valve = $isValve; Max = $effMax; Humans = $h
         Premade = $premade; FriendsOnly = $friendsOnly; Mutation = $mutation; Link = $lobbyLink
         Campaign = (Get-CampaignKey $s.Map); Config = $cfg; Competitive = $competitive; ZoneMod = $zoneMod; Team = $team; Idle = $idle
-        Pending = $pending
+        Pending = $pending; OtherMode = $otherMode
     }
 }
 
@@ -688,7 +714,7 @@ function Sort-ServerRows($rows) { return @($rows | Sort-Object Rank, { [int]$_.I
 # se miran sus jugadores y su config, y sus filas salen enseguida por $OnRows (la ventana las va mostrando).
 # Al final se cruzan los oficiales con sus salas públicas y se devuelve la lista completa y definitiva.
 # $Stats (opcional): se llena con cuántos servers hubo y por qué quedó afuera cada uno
-function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValve, [scriptblock]$OnStatus, [scriptblock]$OnRows, [hashtable]$Stats, [string[]]$Favorites = @()) {
+function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValve, [scriptblock]$OnStatus, [scriptblock]$OnRows, [hashtable]$Stats, [string[]]$Favorites = @(), [string]$Game = 'versus') {
     $stats = if ($null -ne $Stats) { $Stats } else { @{} }
     & $OnStatus 'Pidiendo la lista de servidores a Steam...'
     # Lo que más tarda (salas de los oficiales y servers que se hacen pasar por oficiales) arranca ya, en paralelo
@@ -746,7 +772,7 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
         $valveNear = @($valve | ForEach-Object {
                 $n = if ($players.ContainsKey($_.Addr)) { @($players[$_.Addr]).Count } else { 0 }
                 [pscustomobject]@{ Addr = $_.Addr; Map = $_.Map; Ping = $_.Ping; Humans = [math]::Max($_.Players, $n) } })
-        try { $off.Match = Get-OfficialLobbyMatch $valveNear $off.Lobbies $fakeList $off.Match } catch { $off.Failed = $true; $off.Match = $null; return }
+        try { $off.Match = Get-OfficialLobbyMatch $valveNear $off.Lobbies $fakeList $off.Match $Game } catch { $off.Failed = $true; $off.Match = $null; return }
         foreach ($s in $valve) {
             if (-not $off.Sent.ContainsKey($s.Addr) -or ($skip -and $skip.Contains($s.Addr))) { continue }
             $m = $off.Match[$s.Addr]
@@ -754,7 +780,7 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
             if ($off.Sent[$s.Addr] -eq $sig) { continue }
             $off.Sent[$s.Addr] = $sig
             $plS = if ($players.ContainsKey($s.Addr)) { $players[$s.Addr] } else { @() }
-            ConvertTo-ServerRow $s $plS $rules $off.Match $false $hist $p ($includeBig -or $favSet.Contains($s.Addr))
+            ConvertTo-ServerRow $s $plS $rules $off.Match $false $hist $p ($includeBig -or $favSet.Contains($s.Addr)) $Game
         }
     }
     $signOf = { param($addr) if (& $offPending) { 'pending' } elseif ($null -eq $off.Match) { 'nomatch' } elseif ($off.Match[$addr]) { "$($off.Match[$addr].Lobby)|$($off.Match[$addr].Mode)" } else { 'none' } }
@@ -777,7 +803,7 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
         # Cada server que queda afuera se cuenta por su motivo (la ventana explica por qué hay pocos)
         $nearNow = @(foreach ($i in $infos) {
                 $why = if ($hist.Contains($i.Addr) -and $i.AppId -ne 550) { 'otro' }
-                elseif (-not (Test-VersusServer "$($i.Tags)" "$($i.Name)")) { 'otro' }
+                elseif (-not (Test-GameServer "$($i.Tags)" "$($i.Name)" $Game)) { 'otro' }
                 elseif ($i.Password -ne 0) { 'clave' }
                 elseif ($i.Players -le 0) { 'vacio' }
                 elseif ($i.Ping -gt $maxPing -and -not $favSet.Contains($i.Addr)) { 'ping' }
@@ -800,7 +826,7 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
         $pend = & $offPending
         $rowsNow = @(foreach ($s in $nearNow) {
                 $plS = if ($players.ContainsKey($s.Addr)) { $players[$s.Addr] } else { @() }
-                $row = ConvertTo-ServerRow $s $plS $rules $off.Match $pend $hist $p ($includeBig -or $favSet.Contains($s.Addr))
+                $row = ConvertTo-ServerRow $s $plS $rules $off.Match $pend $hist $p ($includeBig -or $favSet.Contains($s.Addr)) $Game
                 if ($row) {
                     if ($row.Valve) { $off.Sent[$s.Addr] = & $signOf $s.Addr }
                     $row
@@ -813,7 +839,7 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
     # 1) Lista del cliente de Steam (sin key), una dirección por línea apenas llega: se mide mientras tanto
     $clientError = $null
     $sh = $null
-    try { $sh = Start-LobbyHelper $here '-Servers -StreamList' -Stream } catch { $clientError = $_.Exception.Message }
+    try { $sh = Start-LobbyHelper $here ('-Servers -StreamList' + $(if ($Game -eq 'scavenge') { ' -ServerFilter "gamedir=left4dead2,empty=1,notfull=1,gametagsand=scavenge"' } else { '' })) -Stream } catch { $clientError = $_.Exception.Message }
     if ($sh) {
         $reader = $sh.Proc.StandardOutput
         $task = $reader.ReadLineAsync()
@@ -850,7 +876,7 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
         $srvList = @((Invoke-RestMethod -Uri $url -TimeoutSec 20).response.servers)
         foreach ($s in $srvList) { [void]$listed.Add([string]$s.addr) }
         $pre = @($srvList | Where-Object {
-                (Test-VersusServer "$($_.gametype)" "$($_.name)") -and ($_.max_players - $_.players) -ge $p -and
+                (Test-GameServer "$($_.gametype)" "$($_.name)" $Game) -and ($_.max_players - $_.players) -ge $p -and
                 # Los competitivos declaran 14-30 lugares para espectadores: el tamano real se mira despues
                 ($includeBig -or $_.max_players -le 8 -or $_.gametype -match 'confogl') -and
                 -not ($hideValve -and $_.name -like 'Valve Left4Dead 2*')
@@ -912,9 +938,12 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
     # 6) Lista definitiva (los oficiales ya con su sala, o marcados como de solo amigos)
     $rows = foreach ($s in $near) {
         $pl = if ($players.ContainsKey($s.Addr)) { $players[$s.Addr] } else { @() }
-        ConvertTo-ServerRow $s $pl $rules $offMatch $false $hist $p ($includeBig -or $favSet.Contains($s.Addr))
+        ConvertTo-ServerRow $s $pl $rules $offMatch $false $hist $p ($includeBig -or $favSet.Contains($s.Addr)) $Game
     }
-    $rows = Sort-ServerRows @($rows | Where-Object { $_ })
+    # Lo que no es del modo buscado no va (versus realista / supervivencia: oficiales con sala de otro modo)
+    $other = @($rows | Where-Object { $_ -and $_.OtherMode }).Count
+    if ($other) { $stats['otro'] = $other + [int]$stats['otro'] }
+    $rows = Sort-ServerRows @($rows | Where-Object { $_ -and -not $_.OtherMode })
     $stats['listados'] = $listed.Count + $hist.Count
     $stats['contestaron'] = $answered.Count
     $stats['maxping'] = $maxPing
@@ -930,7 +959,7 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
 $settingsFile = Join-Path $here 'settings.json'
 
 function Get-Settings {
-    $s = [ordered]@{ Name = $env:USERNAME; Group = ''; Party = 2; MaxPing = 150; Follow = $false; AutoRefresh = $false; Campaigns = @(); ServerType = ''; LobbyType = ''; ModeFilter = $null; HostFilter = $null; IncludeFriendsOnly = $false; IncludeMutations = $false; PreferIdeal = $false; FollowKey = 'F5'; View = 'servers'; FollowSteamId = ''; SteamFollow = $false; Share = $true; Favorites = @(); ClientId = [guid]::NewGuid().ToString('N') }
+    $s = [ordered]@{ Name = $env:USERNAME; Group = ''; Party = 2; MaxPing = 150; Follow = $false; AutoRefresh = $false; Campaigns = @(); ServerType = ''; LobbyType = ''; ModeFilter = $null; HostFilter = $null; IncludeFriendsOnly = $false; IncludeMutations = $false; PreferIdeal = $false; FollowKey = 'F5'; View = 'servers'; FollowSteamId = ''; SteamFollow = $false; Share = $true; Favorites = @(); Game = 'versus'; ClientId = [guid]::NewGuid().ToString('N') }
     if (Test-Path $settingsFile) {
         try {
             $saved = Get-Content $settingsFile -Raw -Encoding UTF8 | ConvertFrom-Json
