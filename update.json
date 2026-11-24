@@ -1,9 +1,9 @@
 {
-    "version":  12,
-    "notes":  "Selector de modo de juego: versus, versus realista, versus supervivencia y busqueda (scavenge), en partidas en curso y salas de espera",
-    "date":  "2026-11-23 16:49",
+    "version":  13,
+    "notes":  "Sin API key: si Steam contesta la lista de servidores vacia (solo la da cada ~30 s), se usa la ultima lista guardada o se reintenta.",
+    "date":  "2026-11-24 00:26",
     "files":  {
-                  "finder.ps1":  "7ce84af66d5dd48509b5f2febceeeb5eec46303278908ff54308dc493c6154ef",
+                  "finder.ps1":  "47f9d1613ecfe2890f717b4d0a82fdfb5f0dd01424b8c5800fc4c503e4732536",
                   "ui.ps1":  "2691c474b1b1f58fef9094100ef32330e853fba58cc9094c2423cf6e0d87ed20",
                   "vpk.ps1":  "a33358afe20ca8d31901f90d36340322c476b68899215d26a9ee91daad9d40c5",
                   "lobbies.ps1":  "ddf0aa1991f1449285d13c7850156c1b4bb91a88cffd76e7dace8674b543df77",
