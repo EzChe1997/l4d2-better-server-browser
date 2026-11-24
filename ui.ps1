@@ -401,6 +401,21 @@ foreach ($k in $gameModes.Keys) {
     [void]$menuGame.Items.Add($it)
     $gameItems[$k] = $it
 }
+# Solo para quien tiene apikey.txt: poder buscar sin ella (como un amigo) sin renombrar el archivo
+$itemKey = $null
+if (Test-Path (Join-Path $here 'apikey.txt')) {
+    [void]$menuGame.Items.Add((New-Object Windows.Forms.ToolStripSeparator))
+    $itemKey = New-Object Windows.Forms.ToolStripMenuItem('Usar API key de respaldo')
+    $itemKey.Checked = $settings.UseApiKey -ne $false
+    $itemKey.add_Click({
+            $itemKey.Checked = -not $itemKey.Checked
+            $settings.UseApiKey = $itemKey.Checked
+            Save-Settings $settings
+            $status.Text = if ($itemKey.Checked) { 'API key activada: si Steam no da la lista, se usa la Web API.' } else { 'API key apagada: la app busca como alguien que no la tiene.' }
+            Write-AppLog "API key de respaldo: $($itemKey.Checked)"
+        })
+    [void]$menuGame.Items.Add($itemKey)
+}
 $btnGame.add_Click({ $menuGame.Show($btnGame, (New-Object Drawing.Point(0, $btnGame.Height))) })
 function Update-GameButton {
     $short = @{ versus = 'Versus'; mutation12 = 'V. realista'; mutation15 = 'V. supervivencia'; scavenge = 'Búsqueda' }
@@ -1668,16 +1683,17 @@ $btnSearch.add_Click({
         Reset-LiveRows
         $status.Text = $script:searchState.Msg
         Start-Async 'servers' {
-            param($finder, $p, $ping, $big, $valve, $state, $favs, $game)
+            param($finder, $p, $ping, $big, $valve, $state, $favs, $game, $useKey)
             $ErrorActionPreference = 'Stop'
             $here = Split-Path -Parent $finder
-            $keyFile = Join-Path $here 'apikey.txt'
+            # Con la key apagada en el menú, buscar como alguien que no la tiene
+            $keyFile = Join-Path $here $(if ($useKey) { 'apikey.txt' } else { 'apikey-apagada-en-el-menu.txt' })
             # Cargar solo la parte de busqueda de finder.ps1 (sin abrir otra ventana)
             $src = [IO.File]::ReadAllText($finder)
             $a = $src.IndexOf('# >>> BUSQUEDA'); $b = $src.IndexOf('# <<< BUSQUEDA')
             . ([scriptblock]::Create($src.Substring($a, $b - $a)))
             Find-Servers $p $ping $big $valve { param($m) $state.Msg = $m } { param($rows) foreach ($x in $rows) { [void]$state.Rows.Add($x) } } $state.Stats $favs $game
-        } @((Join-Path $here 'finder.ps1'), [int]$numParty.Value, [int]$numPing.Value, [bool]$chkBig.Checked, $false, $script:searchState, [string[]]@($script:favs), $script:game) {
+        } @((Join-Path $here 'finder.ps1'), [int]$numParty.Value, [int]$numPing.Value, [bool]$chkBig.Checked, $false, $script:searchState, [string[]]@($script:favs), $script:game, ($settings.UseApiKey -ne $false)) {
             param($res, $err)
             Stop-Searching
             # Cambiaste de modo mientras buscaba: esta lista ya no sirve, se busca de nuevo
@@ -3002,7 +3018,33 @@ if (-not $Screenshot) {
             Write-AppLog "ERROR: $($ex.GetType().Name): $($ex.Message)$where"
             Write-AppLog "  $(($ex.StackTrace -split "`n" | Select-Object -First 6) -join ' | ')"
             $status.Text = "Ups, algo falló (quedó anotado en eventos.log): $($ex.Message)"
+            # Si falló al dibujarse, WinForms deja el control con una cruz roja para siempre: que se vuelva a dibujar
+            if ("$($ex.StackTrace)" -like '*PaintWithErrorHandling*') { [void]$form.BeginInvoke([Action] { Repair-PaintError }) }
         })
+}
+
+# Un error de dibujo de GDI+ suele ser pasajero: limpiar la marca de error y redibujar (hasta 5 veces por minuto,
+# para no quedar en un bucle si falla siempre)
+$script:paintFixes = New-Object Collections.Generic.List[datetime]
+function Repair-PaintError {
+    $now = Get-Date
+    for ($i = $script:paintFixes.Count - 1; $i -ge 0; $i--) { if (($now - $script:paintFixes[$i]).TotalSeconds -gt 60) { $script:paintFixes.RemoveAt($i) } }
+    if ($script:paintFixes.Count -ge 5) { return }
+    $script:paintFixes.Add($now)
+    $fl = [Reflection.BindingFlags]'NonPublic, Instance'
+    $get = [Windows.Forms.Control].GetMethod('GetState', $fl, $null, [type[]]@([int]), $null)
+    $set = [Windows.Forms.Control].GetMethod('SetState', $fl, $null, [type[]]@([int], [bool]), $null)
+    if (-not $get -or -not $set) { return }
+    $todo = New-Object Collections.Stack
+    $todo.Push($form)
+    while ($todo.Count) {
+        $c = $todo.Pop()
+        if ($get.Invoke($c, @(0x400000))) {   # STATE_EXCEPTIONWHILEPAINTING
+            $set.Invoke($c, @(0x400000, $false)); $c.Invalidate()
+            Write-AppLog "Redibujando $($c.GetType().Name) que había fallado al dibujarse."
+        }
+        foreach ($k in $c.Controls) { $todo.Push($k) }
+    }
 }
 
 # Pruebas sin tocar el grupo real: L4D2_TEST_NOGROUP=1 no avisa nada a ntfy ni guarda la configuración

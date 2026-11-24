@@ -28,7 +28,7 @@ $keyFile = Join-Path $here 'apikey.txt'
 # ======================= actualizaciones automaticas =======================
 # La app se fija si hay una version nueva publicada en GitHub. El indice (update.json) va firmado
 # con una clave que solo tiene quien publica: si la firma no coincide, la actualizacion se ignora.
-$AppVersion = 13
+$AppVersion = 14
 $updateBase = 'https://raw.githubusercontent.com/EzChe1997/l4d2-better-server-browser/main'   # lo completa publicar.ps1 (https://raw.githubusercontent.com/<usuario>/<repo>/main)
 $updatePublicKey = '<RSAKeyValue><Modulus>3uVFz1ZH9ed0Zun/YcmPi4gk8EALr+R7/DYQY+Fz5NArgRYEo1iNfjNpBUn7G3R0Tliw5DjecmnM0/InLrFLJl2BgMmwJo0VBw4BJ/7qmQm1q7oJoZ0mjI8cgxynbgyhARnQY3i9lVnEGfwB3IOnYhire7XM6iFxui9b5fOd3npzorhJakLqdMdPLBc7BT5VE8E/MfeyhlhusGlKpgsB4QWY3U8WufkkE81E5bziCI1m3RYYUVeoqGukzfujshi2OwV9EBpAIWgDmdZNA3UBDwd6Q0ocq2/EvPfzzNZgNbeQObT+DutokxYEz2e8DlZU0ek46JsxTOFQShlNKoOeHUiXMfjfwUc3j6KqYRNUF1VV9xOzML2W9/+l73r6SnmrPVMItghOEzVivQgZ6gtk3Y901stV4yxTB+RFXO89EFbGYF4C2zhGvdssKxuWibjan9P5D6f/00E6uAb4ehy5MT5Cfj7Iy0Wqo8AmKTOFWOJU8BOjDOu7Odbgi8Xs6dNp</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>'
 $updateFiles = @('finder.ps1', 'ui.ps1', 'vpk.ps1', 'lobbies.ps1', 'Buscar versus.bat')
@@ -879,15 +879,17 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
         try { if (-not $sh.Proc.HasExited) { $sh.Proc.Kill() } } catch {}
     }
     # Vino algo, o hay lista guardada para completar, o Steam no está (error real): seguir
-    if ($listed.Count -or $cached.Count -or -not $sh -or ($clientError -and $clientError -notlike 'Steam tardó*')) { break }
+    if ($listed.Count -or $cached.Count -or (Test-Path $keyFile) -or -not $sh -or ($clientError -and $clientError -notlike 'Steam tardó*')) { break }
     if (((Get-Date) - $listT0).TotalSeconds -gt 35) { break }
     & $OnStatus 'Steam está ocupado con la lista de servidores, reintentando...'
     $until = (Get-Date).AddSeconds(5)
     while ((Get-Date) -lt $until) { & $tickOfficial; Start-Sleep -Milliseconds 100 }
     }
-    if ($listed.Count -and $listed.Count -ge $cached.Count / 2) {
+    $clientShort = $listed.Count -eq 0 -or $listed.Count -lt $cached.Count / 2
+    $hasKey = Test-Path $keyFile
+    if (-not $clientShort) {
         try { [IO.File]::WriteAllLines($cacheFile, [string[]]@($listed)) } catch {}
-    } elseif ($cached.Count) {
+    } elseif ($cached.Count -and -not $hasKey) {
         # Steam respondió vacío o cortado: los de la última lista buena también se miden
         $extra = @($cached | Where-Object { $listed.Add($_) })
         for ($i = 0; $i -lt $extra.Count; $i += 40) {
@@ -896,13 +898,14 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
         }
     }
 
-    # 2) Si el cliente no dio nada y hay API key, la Web API como antes
-    if ($listed.Count -eq 0) {
-        if (-not (Test-Path $keyFile)) { throw "No pude pedirle la lista de servidores a Steam: $clientError" }
+    # 2) Si el cliente no dio nada (o vino cortado) y hay API key, la Web API completa la lista
+    if ($listed.Count -eq 0 -or ($clientShort -and $hasKey)) {
+        if (-not $hasKey) { throw "No pude pedirle la lista de servidores a Steam: $clientError" }
         $key = (Get-Content $keyFile -Raw).Trim()
         $url = "https://api.steampowered.com/IGameServersService/GetServerList/v1/?key=$key&limit=5000&filter=" + [uri]::EscapeDataString('\appid\550\empty\1\notfull\1')
         $srvList = @((Invoke-RestMethod -Uri $url -TimeoutSec 20).response.servers)
-        foreach ($s in $srvList) { [void]$listed.Add([string]$s.addr) }
+        # Solo los que el cliente no dio (esos ya se están midiendo)
+        $srvList = @($srvList | Where-Object { $listed.Add([string]$_.addr) })
         $pre = @($srvList | Where-Object {
                 (Test-GameServer "$($_.gametype)" "$($_.name)" $Game) -and ($_.max_players - $_.players) -ge $p -and
                 # Los competitivos declaran 14-30 lugares para espectadores: el tamano real se mira despues
@@ -987,7 +990,7 @@ function Find-Servers([int]$p, [int]$maxPing, [bool]$includeBig, [bool]$hideValv
 $settingsFile = Join-Path $here 'settings.json'
 
 function Get-Settings {
-    $s = [ordered]@{ Name = $env:USERNAME; Group = ''; Party = 2; MaxPing = 150; Follow = $false; AutoRefresh = $false; Campaigns = @(); ServerType = ''; LobbyType = ''; ModeFilter = $null; HostFilter = $null; IncludeFriendsOnly = $false; IncludeMutations = $false; PreferIdeal = $false; FollowKey = 'F5'; View = 'servers'; FollowSteamId = ''; SteamFollow = $false; Share = $true; Favorites = @(); Game = 'versus'; ClientId = [guid]::NewGuid().ToString('N') }
+    $s = [ordered]@{ Name = $env:USERNAME; Group = ''; Party = 2; MaxPing = 150; Follow = $false; AutoRefresh = $false; Campaigns = @(); ServerType = ''; LobbyType = ''; ModeFilter = $null; HostFilter = $null; IncludeFriendsOnly = $false; IncludeMutations = $false; PreferIdeal = $false; FollowKey = 'F5'; View = 'servers'; FollowSteamId = ''; SteamFollow = $false; Share = $true; Favorites = @(); Game = 'versus'; UseApiKey = $true; ClientId = [guid]::NewGuid().ToString('N') }
     if (Test-Path $settingsFile) {
         try {
             $saved = Get-Content $settingsFile -Raw -Encoding UTF8 | ConvertFrom-Json

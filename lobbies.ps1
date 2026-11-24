@@ -476,4 +476,10 @@ try {
 }
 $out = foreach ($d in $list) { $o = [ordered]@{}; foreach ($k in $d.Keys) { $o[$k] = $d[$k] }; [pscustomobject]$o }
 if ($Dump) { $out | Format-List | Out-String -Width 300 }
-else { [Console]::Out.Write((ConvertTo-Json -InputObject @($out) -Depth 3 -Compress)) }
+else {
+    # Todo lo que no es ASCII sale como \uXXXX: la consola lo pasaría a su página de códigos y, por ejemplo,
+    # una comilla tipográfica en el nombre de un mapa custom se volvía " y rompía el JSON entero
+    $json = ConvertTo-Json -InputObject @($out) -Depth 3 -Compress
+    $json = [regex]::Replace($json, '[^\x00-\x7F]', { param($m) '\u{0:x4}' -f [int][char]$m.Value })
+    [Console]::Out.Write($json)
+}
